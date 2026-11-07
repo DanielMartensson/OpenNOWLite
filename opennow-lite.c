@@ -1,6 +1,6 @@
 /*
- * opennow-lite.c - OpenNOWLite stage 1: its own Wayland window, fed by
- * GStreamer, with its own keyboard and pointer pipeline.
+ * opennow-lite.c - OpenNOWLite: its own Wayland window, fed by GStreamer, with
+ * its own keyboard and pointer pipeline.
  *
  * The window is an xdg-shell toplevel created here, not by the video sink and
  * not by opennow-qt. waylandsink draws into that surface: the wl_display goes
@@ -9,28 +9,54 @@
  * so the picture fills this program's window while this program keeps the
  * seat's keyboard and pointer events on the same connection.
  *
- * Stage 1 plays a test pattern, so the window and the input path can be proven
- * with no session at all. Stage 2 replaces videotestsrc with the native
- * streamer's encoded frames and submits the input through
+ * Stage 1 of this recipe played a test pattern, so the window and the input
+ * path could be proven with no session at all; the same switches still do that.
+ * With a launch id the media is the native streamer's: OpenNOWLite asks the
+ * shipped opennow-core for the launch context, the streamer carries the NVST
+ * connection, the input protocol and the encoded H.264 and Opus packets, which
+ * are tapped out of it already encoded and fed to this program's own pipeline,
+ * and the seat's input is submitted back through
  * opennow_streamer_submit_key / opennow_streamer_submit_mouse_*.
  *
  * Markers (grep -a):
  *   opennowlite: window ready
- *   opennowlite: pipeline playing
+ *   opennowlite: pipeline playing                          (test pattern)
  *   opennowlite-input: key ...
  *   opennowlite-input: pointer ...
  *   opennowlite: pipeline error
- *   opennowlite: session <ready|failed>            (stage 2)
- *   opennowlite: launch <method> <error>           (stage 2, RPC failures)
- *   opennowlite: engine <ok|status>                (stage 2)
- *   opennowlite: encoded video|audio <bytes>       (stage 2, first packet)
- *   opennowlite: input submitted <n>               (stage 2)
- *   opennowlite: media path failed                 (stage 2, media setup)
+ *   opennowlite: rpc <method> line=<n>                     (one per core RPC)
+ *   opennowlite: reply for <id> in <n> ms                  (RPC round trip)
+ *   opennowlite: reply for <id> not received within <n>s   (core went silent)
+ *   opennowlite: launch <method> <code>                    (core RPC refusal)
+ *   opennowlite: launch inspect reply=<n> decision=<n> scope=<n> status=<s>
+ *   opennowlite: session create reply=<n> named=<0/1> phase=<s>
+ *   opennowlite: poll attempt=<n> reply=<n> session=<0/1> status=<n> phase=<s> rtsps=<n>
+ *   opennowlite: session ready for <id>                    (launch)
+ *   opennowlite: engine started for <id>                   (streamer up)
+ *   opennowlite: encoded video unit 1 / encoded audio packet 1
+ *   opennowlite: video units=N queued=N / audio packets=N queued=N (media tally
+ *                                                  with the appsrc's own queued
+ *                                                  bytes, every 600 units /
+ *                                                  1500 packets)
+ *   opennowlite: video refused=N / audio refused=N                 (units the
+ *                                                  appsrc would not take)
+ *   opennowlite: pointer locked                            (mouse capture on)
+ *   opennowlite-input: key code=<n> evdev=<n> state=<0/1>   (each key the seat sends)
+ *   opennowlite-input: <kind> submit refused (<n>)          (first refused input call)
+ *   opennowlite: stopping keys=N motions=N submits=N refused=N     (exit tally)
  */
 
 #define OPENNOWLITE_FFI_LIBRARY "/usr/lib/opennowlite/libopennowlite_streamer_ffi.so"
 #define OPENNOWLITE_CORE_PATH "/usr/bin/opennow-core"
 #define OPENNOWLITE_SESSION_TIMEOUT 25
+/* A reply is waited for as long as the thing asked for can take. The core's
+ * own startup (credential store, Electron account migration) runs before it
+ * reads its first request, and the catalog and launch methods are vendor
+ * round trips measured at 15.9 s and 16.4 s on this board's LAN, so a
+ * shorter wait is a LAN that got slow, not a client that is broken. Only the
+ * session.poll status checks, which the core answers from its own state in
+ * tens of milliseconds, keep the short one. */
+#define OPENNOWLITE_RPC_TIMEOUT 60
 #define OPENNOWLITE_CORE_PROTOCOL 6
 
 #define _GNU_SOURCE
@@ -44,6 +70,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 
@@ -99,7 +126,11 @@ struct lite {
     unsigned long keys;
     unsigned long motions;
     unsigned long submits;
+    unsigned long input_refused;
     uint32_t modifier_mask;
+    struct wl_buffer *window_buffer;
+    void *window_pixels;
+    size_t window_bytes;
 };
 
 static struct lite app;
@@ -384,6 +415,75 @@ static const struct wl_registry_listener registry_listener = {
 
 /* ---- window ---- */
 
+/* The window's own frame. waylandsink does not draw into this surface: it
+ * makes a subsurface of it (gst_wl_window_new_in_surface) and draws there, and
+ * weston maps a view only when the surface itself has content. A bufferless
+ * parent is therefore never mapped, and its subsurface is never shown either -
+ * measured on the seat: with no parent buffer the media tallies advanced
+ * (`video units=34800`, `/dev/video5` held open, dmabuf fds allocated, no
+ * pipeline error) and the TV showed no window at all, while weston's own
+ * `weston-flower` appeared on the same seat in the same second. So one
+ * XRGB8888 frame the size of the window is committed after the first
+ * configure, and the sink's subsurface renders on top of it. */
+static int anonymous_file(size_t size)
+{
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    char name[256];
+    snprintf(name, sizeof(name), "%s/opennowlite-frame-XXXXXX",
+             dir && *dir ? dir : "/tmp");
+    int fd = mkstemp(name);
+    if (fd < 0)
+        return -1;
+    unlink(name);
+    if (ftruncate(fd, (off_t)size) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool window_frame_commit(struct lite *a)
+{
+    const int stride = a->width * 4;
+    const size_t size = (size_t)stride * (size_t)a->height;
+    int fd = anonymous_file(size);
+    if (fd < 0) {
+        fprintf(stderr, "opennowlite: window frame file failed: %s\n",
+                strerror(errno));
+        return false;
+    }
+    void *pixels = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (pixels == MAP_FAILED) {
+        fprintf(stderr, "opennowlite: window frame map failed: %s\n",
+                strerror(errno));
+        close(fd);
+        return false;
+    }
+    /* A dark slate, not black: a black window on this background is as
+     * invisible as no window. XRGB8888 ignores the top byte. */
+    uint32_t *words = pixels;
+    for (size_t i = 0; i < size / 4u; ++i)
+        words[i] = 0x00101820u;
+
+    struct wl_shm_pool *pool = wl_shm_create_pool(a->shm, fd, (int32_t)size);
+    a->window_buffer = wl_shm_pool_create_buffer(pool, 0, a->width, a->height,
+                                                 stride, WL_SHM_FORMAT_XRGB8888);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    if (!a->window_buffer) {
+        munmap(pixels, size);
+        return false;
+    }
+    a->window_pixels = pixels;
+    a->window_bytes = size;
+
+    wl_surface_attach(a->surface, a->window_buffer, 0, 0);
+    wl_surface_damage_buffer(a->surface, 0, 0, a->width, a->height);
+    wl_surface_commit(a->surface);
+    wl_display_flush(a->display);
+    return true;
+}
+
 static bool create_window(struct lite *a)
 {
     a->surface = wl_compositor_create_surface(a->compositor);
@@ -401,7 +501,15 @@ static bool create_window(struct lite *a)
     xdg_toplevel_add_listener(a->toplevel, &toplevel_listener, a);
     xdg_toplevel_set_title(a->toplevel, "OpenNOWLite");
     xdg_toplevel_set_app_id(a->toplevel, "opennowlite");
+    /* State the size before the first commit: stable xdg-shell has no
+     * set_size request, the size is the buffer the surface attaches, and the
+     * geometry the client declares here is what desktop-shell places. This
+     * program is not a toolkit that declares one by itself. */
+    xdg_surface_set_window_geometry(a->xdg_surface, 0, 0, a->width, a->height);
+    if (a->fullscreen)
+        xdg_toplevel_set_fullscreen(a->toplevel, NULL);
 
+    /* No buffer in this commit: it only asks for the initial configure. */
     wl_surface_commit(a->surface);
     wl_display_flush(a->display);
 
@@ -415,11 +523,14 @@ static bool create_window(struct lite *a)
     if (!running)
         return false;
 
-    if (a->fullscreen)
-        xdg_toplevel_set_fullscreen(a->toplevel, NULL);
+    /* From here the surface has content, so weston maps the window - with its
+     * title bar and close button and a place on the desktop - while the
+     * vendor queue is still being waited out. */
+    if (!window_frame_commit(a))
+        return false;
 
-    fprintf(stderr, "opennowlite: window ready surface=%p app_id=opennowlite\n",
-            (void *)a->surface);
+    fprintf(stderr, "opennowlite: window ready surface=%p app_id=opennowlite size=%dx%d\n",
+            (void *)a->surface, a->width, a->height);
     return true;
 }
 
@@ -522,6 +633,11 @@ static bool drain_bus(struct lite *a)
     }
     return true;
 }
+
+/* The audio pipeline has its own bus. Errors on it used to be invisible, so
+ * this reports them the same way the video bus reports its own and names the
+ * chain, because "pipeline error" alone would not say which one stopped.
+ * It is defined with the media struct further down. */
 
 /* ================= STAGE 2: session bootstrap + streamer + encoded media =================
  *
@@ -626,6 +742,11 @@ static const char *json_value_end(const char *at)
     return at > at_value ? at : NULL;
 }
 
+/* The body advances by itself: json_char moves it past the character (or
+ * escape) it returned, and walking it a second time per step is what cut
+ * every other character of every value - "lite-hello" came back as "lt-el",
+ * which is how the id match below failed and how the launch inspection was
+ * asked for with a mangled appId, answered catalog_game_not_found. */
 static bool json_string(const char *doc, const char *key, char *out,
                        size_t capacity)
 {
@@ -633,7 +754,8 @@ static bool json_string(const char *doc, const char *key, char *out,
     if (!at || *at != '"')
         return false;
     size_t written = 0;
-    for (const char *body = at + 1; *body; ++body) {
+    const char *body = at + 1;
+    while (*body) {
         if (*body == '"')
             break;
         char value = json_char(&body);
@@ -674,7 +796,17 @@ static bool json_true(const char *doc, const char *key)
 
 /* ---- the core's JSON-lines RPC ---- */
 
-#define CORE_READ_MAX 32768
+/* A reply line is one of the vendor's own documents: catalog.launch.inspect
+ * carries the whole launch decision with the account's entitlement scope
+ * inside it, and that scope is a grant over the account's library, so it has
+ * no small fixed bound and was silently dropped at the old 32 KiB. The bound
+ * here is what the read loop stops at, and it is generous; the request line
+ * has no bound at all any more, since core_request sizes its own line. The
+ * stack buffers of the callers keep the smaller bound below: none of the
+ * params objects they build by hand comes close to it, and the one params
+ * object that does carry a reply-sized value (the session.create scope) is
+ * sized from the reply it came out of, in that caller. */
+#define CORE_READ_MAX 262144
 #define CORE_LINE_MAX 8192
 
 typedef struct CoreRpc {
@@ -690,28 +822,46 @@ static struct CoreRpc *core_rpc;
 /* The core is not an endpoint the shell connects to, it is a process the shell
  * pipes: src/main.rs reads requests with io::stdin().lines() and its writer
  * thread writes one reply per line to stdout, which is how opennow-qt's
- * CoreClient drives it through QProcess. A socketpair gives the parent two
- * ends of one socket: the write end becomes the child's stdin, the read end
- * its stdout. Closing the write end when this program leaves is what hands
- * the core an end of input, so its Drop implementations stop and reap the
- * out-of-process native streamer and no orphan worker is left on the seat. */
+ * CoreClient drives it through QProcess - two channels, one per direction.
+
+ * One socket with two ends is not that shape, and the seat proved it: this
+ * glibc's SOCK_STREAM socketpair puts both of its ends on one stream queue,
+ * so the parent's next read handed back the request line it had just written
+ * (a line whose "type" is "request", which the reply loop reads past) while
+ * the core sat at its read(0 having received nothing, and the client waited
+ * forever on a reply that could never come. Two pipes, one per direction,
+ * give the core the stdin and the stdout it actually has, and a measured
+ * child that echoes the line it read round-trips through that shape and
+ * through it only.
+
+ * Closing the request end when this program leaves is what hands the core an
+ * end of input, so its Drop implementations stop and reap the out-of-process
+ * native streamer and no orphan worker is left on the seat. */
 static struct CoreRpc *core_start(const char *data_dir)
 {
-    int ends[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, ends) != 0)
+    int in_pipe[2];
+    int out_pipe[2];
+    if (pipe(in_pipe) != 0)
         return NULL;
+    if (pipe(out_pipe) != 0) {
+        close(in_pipe[0]);
+        close(in_pipe[1]);
+        return NULL;
+    }
 
     pid_t child = fork();
     if (child < 0) {
-        close(ends[0]);
-        close(ends[1]);
+        close(in_pipe[0]);
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
         return NULL;
     }
     if (child == 0) {
         /* The child keeps this program's stderr, so the core's own
          * diagnostics land in the run log. execv replaces the image, so
          * nothing of the window, the pipeline or the callbacks survives. */
-        if (dup2(ends[0], STDIN_FILENO) < 0 || dup2(ends[1], STDOUT_FILENO) < 0)
+        if (dup2(in_pipe[0], STDIN_FILENO) < 0 || dup2(out_pipe[1], STDOUT_FILENO) < 0)
             _exit(127);
         char *with_dir[3] = {
             (char *)"--data-dir", (char *)data_dir, NULL
@@ -723,20 +873,28 @@ static struct CoreRpc *core_start(const char *data_dir)
 
     struct CoreRpc *rpc = calloc(1, sizeof(*rpc));
     if (!rpc) {
-        close(ends[0]);
-        close(ends[1]);
+        close(in_pipe[0]);
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
         return NULL;
     }
-    rpc->write_fd = ends[0];
-    rpc->read_fd = ends[1];
+    rpc->write_fd = in_pipe[1];
+    rpc->read_fd = out_pipe[0];
     rpc->child = child;
     rpc->buffer = malloc(CORE_READ_MAX);
     if (!rpc->buffer) {
-        close(ends[0]);
-        close(ends[1]);
+        close(in_pipe[0]);
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
         free(rpc);
         return NULL;
     }
+    /* The two ends the parent has no use for: the child's stdin and stdout
+     * are the other two ends of these pipes and were dup2'd into place. */
+    close(in_pipe[0]);
+    close(out_pipe[1]);
     return rpc;
 }
 
@@ -796,18 +954,37 @@ static bool core_write_line(struct CoreRpc *rpc, const char *line)
 
 /* The core's own framing: one compact JSON object per line, whose type is
  * request, ack or cancel, and a request carries an id, a method and a params
- * object. There is no blank-line framing anywhere in that protocol. */
+ * object. There is no blank-line framing anywhere in that protocol.
+
+ * The line is the size its own params need, not a fixed one: session.create
+ * carries the whole account scope the launch inspection returned, and that
+ * scope is a grant over the account's library, so a fixed line clipped it
+ * silently and left a truncated JSON document on the wire, which the core
+ * then never answered at all. The method and the line's size are logged
+ * before it goes out, because a request the core never got is otherwise
+ * indistinguishable from one the core refused. */
 static bool core_request(struct CoreRpc *rpc, const char *id, const char *method,
                         const char *params)
 {
-    char line[CORE_LINE_MAX];
-    int length = snprintf(line, sizeof(line),
+    const char *body = (params && *params) ? params : "{}";
+    int length = snprintf(NULL, 0,
         "{\"type\":\"request\",\"id\":\"%s\",\"method\":\"%s\","
-        "\"params\":%s}\n", id, method,
-        params && *params ? params : "{}");
-    if (length < 0 || (size_t)length >= sizeof(line))
+        "\"params\":%s}\n", id, method, body);
+    if (length <= 0)
         return false;
-    return core_write_line(rpc, line);
+    fprintf(stderr, "opennowlite: rpc %s line=%d\n", method, length - 1);
+    char *line = malloc((size_t)length + 1);
+    if (!line)
+        return false;
+    snprintf(line, (size_t)length + 1,
+        "{\"type\":\"request\",\"id\":\"%s\",\"method\":\"%s\","
+        "\"params\":%s}\n", id, method, body);
+    bool sent = core_write_line(rpc, line);
+    free(line);
+    if (!sent)
+        fprintf(stderr, "opennowlite: rpc %s not sent: %s\n", method,
+                errno == EPIPE ? "core closed its input" : strerror(errno));
+    return sent;
 }
 
 /* A created cloud session is only kept if the shell acknowledges the create
@@ -823,10 +1000,20 @@ static bool core_ack(struct CoreRpc *rpc, const char *id)
     return core_write_line(rpc, line);
 }
 
-/* One reply = one JSON line. Responses carry the request's id, events
- * (session.changed, settings.changed, ...) do not, so they are read past
- * rather than dropped, and only a response for the id asked for is returned.
- * The copy is the caller's to free. */
+/* One reply = one JSON line. The core's own replies were measured on this
+ * board: a hello answer is exactly {"id":"<request id>","ok":true,"result":
+ * {...}} - it carries the request's id and an "ok" member but no "type" at
+ * all, so a reply is recognised by those two and not by a type that is never
+ * sent. The only lines that do carry a type are the ones this program writes
+ * (request, ack, cancel) and the events the core publishes on its own (a
+ * type of event), and those are read past rather than mistaken for a reply.
+ * The copy is the caller's to free.
+
+ * The wait for the next byte is bounded by the same timeout the caller asked
+ * for: a bare read would sit in the kernel for as long as the core has
+ * nothing to say, which is what a session that never got its request line
+ * looked like - a live client and a core stopped at its own read, neither of
+ * them logging anything, on a seat the user cannot reach. */
 static char *core_reply(struct CoreRpc *rpc, const char *want, int timeout_s)
 {
     struct timespec then;
@@ -834,8 +1021,30 @@ static char *core_reply(struct CoreRpc *rpc, const char *want, int timeout_s)
     for (;;) {
         char *end = memchr(rpc->buffer, '\n', rpc->used);
         if (!end) {
-            if (rpc->used + 4096 >= CORE_READ_MAX)
+            long elapsed = ms_since(&then);
+            long remaining_ms = (long)timeout_s * 1000L - elapsed;
+            if (remaining_ms <= 0) {
+                fprintf(stderr, "opennowlite: reply for %s not received within %lds\n",
+                        want, (long)timeout_s);
                 return NULL;
+            }
+            if (rpc->used + 4096 >= CORE_READ_MAX) {
+                fprintf(stderr, "opennowlite: reply for %s over %d bytes\n",
+                        want, CORE_READ_MAX);
+                return NULL;
+            }
+            struct pollfd waiting = { .fd = rpc->read_fd, .events = POLLIN };
+            int ready = poll(&waiting, 1, (int)remaining_ms);
+            if (ready == 0) {
+                fprintf(stderr, "opennowlite: reply for %s not received within %lds\n",
+                        want, (long)timeout_s);
+                return NULL;
+            }
+            if (ready < 0 && errno != EINTR) {
+                fprintf(stderr, "opennowlite: reply for %s not readable: %s\n",
+                        want, strerror(errno));
+                return NULL;
+            }
             ssize_t got = read(rpc->read_fd, rpc->buffer + rpc->used, 4096);
             if (got < 0 && errno == EINTR)
                 continue;
@@ -857,13 +1066,21 @@ static char *core_reply(struct CoreRpc *rpc, const char *want, int timeout_s)
         char type[16] = "";
         char got[64];
         json_string(document, "\"type\"", type, sizeof(type));
-        bool response = !strcmp(type, "response");
+        bool framed = !strcmp(type, "event") || !strcmp(type, "request") ||
+                      !strcmp(type, "ack") || !strcmp(type, "cancel");
         bool has_id = json_string(document, "\"id\"", got, sizeof(got));
-        if (response && (!want[0] || (has_id && !strcmp(got, want))))
+        bool is_reply = !framed && json_value_at(document, "\"ok\"") != NULL;
+        if (is_reply && (!want[0] || (has_id && !strcmp(got, want)))) {
+            fprintf(stderr, "opennowlite: reply for %s in %ld ms\n", want,
+                    ms_since(&then));
             return document;
+        }
         free(document);
-        if (ms_since(&then) > (long)timeout_s * 1000L)
+        if (ms_since(&then) > (long)timeout_s * 1000L) {
+            fprintf(stderr, "opennowlite: reply for %s not received within %lds\n",
+                    want, (long)timeout_s);
             return NULL;
+        }
     }
 }
 
@@ -1015,31 +1232,90 @@ static void on_frame_available(void *unused)
  * key can never press the wrong one in the game. */
 static uint16_t linux_virtual_key(uint32_t evdev)
 {
-    switch (evdev + 8) {
-    case 10: return 0x31; case 11: return 0x32; case 12: return 0x33;
-    case 13: return 0x34; case 14: return 0x35; case 15: return 0x36;
-    case 16: return 0x37; case 17: return 0x38; case 18: return 0x39;
-    case 19: return 0x30;
-    case 20: return 0xbd; case 21: return 0xbb;
-    case 24: return 0x51; case 25: return 0x57; case 26: return 0x45;
-    case 27: return 0x52; case 28: return 0x54; case 29: return 0x59;
-    case 30: return 0x55; case 31: return 0x49; case 32: return 0x4f;
-    case 33: return 0x50; case 34: return 0xdb; case 35: return 0xdd;
-    case 37: return 0xa2; case 38: return 0x41; case 39: return 0x53;
-    case 40: return 0x44; case 41: return 0x46; case 42: return 0x47;
-    case 43: return 0x48; case 44: return 0x4a; case 45: return 0x4b;
-    case 46: return 0x4c; case 47: return 0xba; case 48: return 0xde;
-    case 50: return 0xa0; case 51: return 0xdc; case 52: return 0x5a;
-    case 53: return 0x58; case 54: return 0x43; case 55: return 0x56;
-    case 56: return 0x42; case 57: return 0x4e; case 58: return 0x4d;
-    case 59: return 0xbc; case 60: return 0xbe; case 61: return 0xbf;
-    case 62: return 0xa1; case 64: return 0xa4; case 65: return 0x20;
-    case 95: return 0xa5; case 99: return 0x5b; case 102: return 0x5c;
-    case 103: return 0x26; case 105: return 0x27; case 106: return 0x25;
-    case 108: return 0x28;
-    case 110: return 0x22; case 111: return 0x23; case 112: return 0x24;
-    case 113: return 0x2e; case 114: return 0x2d;
-    case 1: return 0x1b; case 9: return 0x09;
+    /* Upstream's en-US physical map, indexed by evdev code
+     * (opennow-qt/src/streaming/PhysicalKeyMapData.h, Layout.virtualKeys[128]).
+     * Its entries cover the character block only; the keys that have no
+     * character come from upstream's own special-key switch
+     * (StreamVideoItemInput.cpp) below. Measured on the seat: the table this
+     * replaces had no Return entry at all, so pressing Enter on the vendor's
+     * OK popup produced no virtual key and nothing was sent, and Escape came
+     * out as Tab because the old code switched on the X11 keycode (evdev + 8)
+     * with a table that was not shifted the same way. */
+    static const uint16_t en_us[128] = {
+        0x00, 0x00, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
+        0x37, 0x38, 0x39, 0x30, 0xbd, 0xbb, 0x00, 0x00,
+        0x51, 0x57, 0x45, 0x52, 0x54, 0x59, 0x55, 0x49,
+        0x4f, 0x50, 0xdb, 0xdd, 0x00, 0x00, 0x41, 0x53,
+        0x44, 0x46, 0x47, 0x48, 0x4a, 0x4b, 0x4c, 0xba,
+        0xde, 0xc0, 0x00, 0xdc, 0x5a, 0x58, 0x43, 0x56,
+        0x42, 0x4e, 0x4d, 0xbc, 0xbe, 0xbf, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe2, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    if (evdev < 128u && en_us[evdev])
+        return en_us[evdev];
+    switch (evdev) {
+    case 1: return 0x1b;   /* Escape */
+    case 14: return 0x08;  /* Backspace */
+    case 15: return 0x09;  /* Tab */
+    case 28: return 0x0d;  /* Return */
+    case 29: return 0xa2;  /* Left Ctrl */
+    case 42: return 0xa0;  /* Left Shift */
+    case 54: return 0xa1;  /* Right Shift */
+    case 56: return 0xa4;  /* Left Alt */
+    case 58: return 0x14;  /* CapsLock */
+    case 69: return 0x90;  /* NumLock */
+    case 70: return 0x91;  /* ScrollLock */
+    case 96: return 0x0d;  /* Keypad Enter */
+    case 97: return 0xa3;  /* Right Ctrl */
+    case 99: return 0x2a;  /* Print / SysRq */
+    case 100: return 0xa5; /* AltGr (Right Alt) */
+    case 102: return 0x24; /* Home */
+    case 103: return 0x26; /* Up */
+    case 104: return 0x21; /* Page Up */
+    case 105: return 0x25; /* Left */
+    case 106: return 0x27; /* Right */
+    case 107: return 0x23; /* End */
+    case 108: return 0x28; /* Down */
+    case 109: return 0x22; /* Page Down */
+    case 110: return 0x2d; /* Insert */
+    case 111: return 0x2e; /* Delete */
+    case 119: return 0x13; /* Pause */
+    case 125: return 0x5b; /* Left Super */
+    case 126: return 0x5c; /* Right Super */
+    case 127: return 0x5d; /* Menu */
+    default: break;
+    }
+    /* Function keys and keypad digits are not in the physical map either:
+     * upstream maps F1..F24 to 0x70 + n and keypad digits to the plain
+     * digits. */
+    if (evdev >= 59u && evdev <= 68u)
+        return (uint16_t)(0x70u + (evdev - 59u));   /* F1..F10 */
+    if (evdev == 87u || evdev == 88u)
+        return (uint16_t)(0x7au + (evdev - 87u));   /* F11, F12 */
+    switch (evdev) {
+    case 71: return 0x37;  /* Keypad 7 */
+    case 72: return 0x38;  /* Keypad 8 */
+    case 73: return 0x39;  /* Keypad 9 */
+    case 75: return 0x34;  /* Keypad 4 */
+    case 76: return 0x35;  /* Keypad 5 */
+    case 77: return 0x36;  /* Keypad 6 */
+    case 79: return 0x31;  /* Keypad 1 */
+    case 80: return 0x32;  /* Keypad 2 */
+    case 81: return 0x33;  /* Keypad 3 */
+    case 82: return 0x30;  /* Keypad 0 */
+    case 55: return 0x6a;  /* Keypad * */
+    case 74: return 0x6d;  /* Keypad - */
+    case 78: return 0x6b;  /* Keypad + */
+    case 83: return 0x6e;  /* Keypad . */
+    case 98: return 0x6f;  /* Keypad / */
     default: return 0;
     }
 }
@@ -1048,12 +1324,18 @@ static uint16_t linux_virtual_key(uint32_t evdev)
  * bits that were down when the key moved. */
 static uint16_t modifier_bits(uint32_t modifier_mask)
 {
+    /* The mask weston sends is an xkb modifier mask: bit 0 shift, bit 1
+     * caps-lock, bit 2 control, bit 3 alt (Mod1), bit 6 super (Mod4). GFN's
+     * own modifier field is 0x01 shift, 0x02 control, 0x04 alt, 0x08 super,
+     * so control comes from bit 2 and alt from bit 3 - reading bit 1 as
+     * control would have sent caps-lock as control and never sent control at
+     * all. */
     uint16_t bits = 0;
     if (modifier_mask & (1u << 0))
         bits |= 0x01;
-    if (modifier_mask & (1u << 1))
-        bits |= 0x02;
     if (modifier_mask & (1u << 2))
+        bits |= 0x02;
+    if (modifier_mask & (1u << 3))
         bits |= 0x04;
     if (modifier_mask & (1u << 6))
         bits |= 0x08;
@@ -1104,7 +1386,7 @@ static bool session_open(const char *variant_id, const char *data_dir)
         OPENNOWLITE_CORE_PROTOCOL);
     if (!core_request(core_rpc, "lite-hello", "core.hello", params))
         return false;
-    frame = core_reply(core_rpc, "lite-hello", 10);
+    frame = core_reply(core_rpc, "lite-hello", OPENNOWLITE_RPC_TIMEOUT);
     if (core_refused(core_rpc, frame, "core.hello")) {
         free(frame);
         return false;
@@ -1117,7 +1399,7 @@ static bool session_open(const char *variant_id, const char *data_dir)
      * so the game object is taken first and its id read out of that. */
     snprintf(params, sizeof(params), "{\"variantId\":\"%s\"}", variant_id);
     core_request(core_rpc, "lite-game", "catalog.game.get", params);
-    frame = core_reply(core_rpc, "lite-game", 25);
+    frame = core_reply(core_rpc, "lite-game", OPENNOWLITE_RPC_TIMEOUT);
     if (core_refused(core_rpc, frame, "catalog.game.get")) {
         free(frame);
         return false;
@@ -1139,45 +1421,88 @@ static bool session_open(const char *variant_id, const char *data_dir)
     snprintf(params, sizeof(params), "{\"appId\":\"%s\",\"variantId\":\"%s\"}",
             game_id, variant_id);
     core_request(core_rpc, "lite-launch", "catalog.launch.inspect", params);
-    frame = core_reply(core_rpc, "lite-launch", 25);
+    frame = core_reply(core_rpc, "lite-launch", OPENNOWLITE_RPC_TIMEOUT);
     if (core_refused(core_rpc, frame, "catalog.launch.inspect")) {
         free(frame);
         return false;
     }
-    char decision[1024];
-    decision[0] = '\0';
-    char scope[4096] = "";
+    /* The decision and the scope are taken at the reply's own size. The
+     * scope is re-emitted into session.create byte for byte, which is what
+     * CloudMatch compares, so a fixed buffer here would either drop a scope
+     * that does not fit - and then no session is asked for at all, with
+     * nothing on the log to say why - or send half of one. */
+    size_t reply_len = strlen(frame);
+    char *decision = malloc(reply_len + 1);
+    char *scope = malloc(reply_len + 1);
     char launch_status[64] = "";
-    if (json_raw(frame, "\"decision\"", decision, sizeof(decision)))
+    if (!decision || !scope) {
+        fprintf(stderr, "opennowlite: launch inspection reply=%zu bytes: out of memory\n",
+                reply_len);
+        free(frame);
+        free(decision);
+        free(scope);
+        return false;
+    }
+    decision[0] = '\0';
+    scope[0] = '\0';
+    if (json_raw(frame, "\"decision\"", decision, reply_len + 1))
         json_string(decision, "\"status\"", launch_status,
                     sizeof(launch_status));
-    json_raw(frame, "\"scope\"", scope, sizeof(scope));
+    json_raw(frame, "\"scope\"", scope, reply_len + 1);
+    fprintf(stderr, "opennowlite: launch inspect reply=%zu decision=%zu scope=%zu status=%s\n",
+            reply_len, decision[0] ? strlen(decision) : 0,
+            scope[0] ? strlen(scope) : 0,
+            launch_status[0] ? launch_status : "unknown");
     free(frame);
     if (strcmp(launch_status, "ready") != 0) {
         fprintf(stderr, "opennowlite: launch is not ready: %s\n",
                 launch_status[0] ? launch_status : "unknown");
+        free(decision);
+        free(scope);
         return false;
     }
     if (!scope[0]) {
         fprintf(stderr, "opennowlite: launch inspection carried no account scope\n");
+        free(decision);
+        free(scope);
         return false;
     }
+    free(decision);
 
     /* 4 · CloudMatch consent for this launch. The launch id is the variant,
      * the catalog id is the parent game, and the account scope is re-emitted
-     * exactly as the core wrote it, since it is compared byte for byte. */
-    snprintf(params, sizeof(params),
+     * exactly as the core wrote it, since it is compared byte for byte. The
+     * params object is the scope plus a little, so it is sized from the scope. */
+    size_t params_len = strlen(scope) + 512;
+    char *big_params = malloc(params_len);
+    if (!big_params) {
+        fprintf(stderr, "opennowlite: session.create params: out of memory\n");
+        free(scope);
+        return false;
+    }
+    snprintf(big_params, params_len,
         "{\"appId\":\"%s\",\"catalogAppId\":\"%s\",\"variantId\":\"%s\","
         "\"scope\":%s}",
         variant_id, game_id, variant_id, scope);
-    core_request(core_rpc, "lite-create", "session.create", params);
-    frame = core_reply(core_rpc, "lite-create", OPENNOWLITE_SESSION_TIMEOUT);
+    free(scope);
+    if (!core_request(core_rpc, "lite-create", "session.create", big_params)) {
+        free(big_params);
+        return false;
+    }
+    free(big_params);
+    frame = core_reply(core_rpc, "lite-create", OPENNOWLITE_RPC_TIMEOUT);
     if (core_refused(core_rpc, frame, "session.create")) {
         free(frame);
         return false;
     }
     char session_id[256] = "";
-    json_string(frame, "\"sessionId\"", session_id, sizeof(session_id));
+    bool session_named =
+        json_string(frame, "\"sessionId\"", session_id, sizeof(session_id));
+    char created_phase[32] = "";
+    (void)json_string(frame, "\"phase\"", created_phase, sizeof(created_phase));
+    fprintf(stderr, "opennowlite: session create reply=%zu named=%d phase=%s\n",
+            strlen(frame), session_named,
+            created_phase[0] ? created_phase : "-");
     free(frame);
     if (!session_id[0]) {
         fprintf(stderr, "opennowlite: the allocated session has no id\n");
@@ -1189,9 +1514,23 @@ static bool session_open(const char *variant_id, const char *data_dir)
 
     /* 5 · wait until the vendor marks the session ready, then let the core's
      * own negotiator produce the NVST context. The core keeps the session, so
-     * the id is enough to address it and the context comes back verbatim. */
+     * the id is enough to address it and the context comes back verbatim.
+     *
+     * The poll result is {"session":{...}} - the session info carries the
+     * numeric status, a phase word, the rtsps endpoints and the artwork, so
+     * like the launch decision it is taken at the reply's own size: with the
+     * old fixed 8 KiB buffer a session info that came close to it was
+     * dropped whole (json_raw refuses when the value does not fit), the
+     * status parsed as 0 and the loop reported not-ready forever. */
+    /* The vendor's own shell polls the same allocation with a 35 s request
+     * timeout on a 2 s interval and leaves the queue wait to the account's
+     * turn, which on a free-tier queue runs into minutes, so the wait here
+     * is long too: giving up after eight tries stopped the client while the
+     * allocation was still preparing, and the seat never got a picture. */
     bool prepared = false;
-    for (int attempt = 0; attempt < 8 && !prepared; ++attempt) {
+    int last_status = 0;
+    char last_phase[32] = "";
+    for (int attempt = 0; attempt < 60 && !prepared; ++attempt) {
         snprintf(params, sizeof(params), "{\"sessionId\":\"%s\"}", session_id);
         core_request(core_rpc, "lite-poll", "session.poll", params);
         frame = core_reply(core_rpc, "lite-poll", OPENNOWLITE_SESSION_TIMEOUT);
@@ -1201,21 +1540,45 @@ static bool session_open(const char *variant_id, const char *data_dir)
         }
         bool ready = false;
         if (!core_refused(core_rpc, frame, "session.poll")) {
-            char poll[CORE_LINE_MAX];
+            char *poll = malloc(strlen(frame) + 1);
+            if (!poll) {
+                fprintf(stderr, "opennowlite: session poll: out of memory\n");
+                free(frame);
+                return false;
+            }
             poll[0] = '\0';
-            (void)json_raw(frame, "\"session\"", poll, sizeof(poll));
+            bool got_session = json_raw(frame, "\"session\"", poll,
+                                        strlen(frame) + 1);
             int status = json_int_at(poll, "\"status\"");
+            char phase[32] = "";
+            json_string(poll, "\"phase\"", phase, sizeof(phase));
+            char *rtsps = malloc(strlen(frame) + 1);
+            rtsps[0] = '\0';
+            (void)json_raw(poll, "\"rtspsEndpoints\"", rtsps,
+                           strlen(frame) + 1);
+            fprintf(stderr, "opennowlite: poll attempt=%d reply=%zu session=%d status=%d phase=%s rtsps=%zu\n",
+                    attempt + 1, strlen(frame), got_session, status,
+                    phase[0] ? phase : "-", rtsps[0] ? strlen(rtsps) : 0);
+            free(rtsps);
             ready = status == 2 || status == 3;
+            last_status = status;
+            if (phase[0]) {
+                strncpy(last_phase, phase, sizeof(last_phase) - 1);
+                last_phase[sizeof(last_phase) - 1] = '\0';
+            }
+            free(poll);
         }
         free(frame);
         frame = NULL;
-        if (!ready)
+        if (!ready) {
+            usleep(2000000u);
             continue;
+        }
 
         snprintf(params, sizeof(params),
             "{\"session\":{\"sessionId\":\"%s\"}}", session_id);
         core_request(core_rpc, "lite-prepare", "streamer.prepare", params);
-        frame = core_reply(core_rpc, "lite-prepare", 25);
+        frame = core_reply(core_rpc, "lite-prepare", OPENNOWLITE_RPC_TIMEOUT);
         if (core_refused(core_rpc, frame, "streamer.prepare")) {
             free(frame);
             frame = NULL;
@@ -1227,7 +1590,8 @@ static bool session_open(const char *variant_id, const char *data_dir)
         frame = NULL;
     }
     if (!prepared) {
-        fprintf(stderr, "opennowlite: streamer context unavailable\n");
+        fprintf(stderr, "opennowlite: streamer context unavailable: last poll status=%d phase=%s\n",
+                last_status, last_phase[0] ? last_phase : "-");
         return false;
     }
     fprintf(stderr, "opennowlite: session ready for %s\n", variant_id);
@@ -1236,45 +1600,101 @@ static bool session_open(const char *variant_id, const char *data_dir)
 
 /* ---- the encoded-media hand-off ---- */
 
-/* The streamer sends one NAL unit per video packet, while h264parse is fed one
- * complete access unit at a time - the shape the proven yt-gst file hand-off
- * uses. So units are reassembled here: parameter sets stay in the buffer until
- * the picture's last slice closes it. */
+/* The tap hands over what the streamer already assembled: one video packet is
+ * one complete access unit (its own ingress log says so: "media-ingress
+ * first assembled video bytes=31550 keyframe=true", "nvst-keyframe
+ * assembled frame=35431 bytes=21556"), and one audio packet is one complete
+ * Opus frame. So the bytes go straight into this program's pipeline: h264parse
+ * is fed the continuous byte stream its own caps describe
+ * (stream-format=byte-stream,alignment=au) and finds the unit boundaries
+ * itself. An accumulator that only flushed on the keyframe flag was the
+ * reason the picture stopped: the flag is set on a fraction of the units, the
+ * accumulator filled its 16 MiB cap between two of them and reported
+ * "video unit overflow", and the bytes it then pushed crossed unit boundaries
+ * mid-picture. */
 typedef struct Media {
     GstElement *video;
     GstElement *audio;
+    GstBus *audio_bus;
     gboolean audio_ready;
     GstAppSrc *video_source;
     GstAppSrc *audio_source;
-    guint8 *video_bytes;
-    gsize video_used;
-    gsize video_cap;
     guint64 video_base;
     guint64 audio_base;
     guint64 video_units;
     guint64 audio_units;
+    guint64 video_refused;
+    guint64 audio_refused;
 } Media;
 
 static Media media;
+
+/* The audio pipeline has its own bus. Errors on it used to be invisible, so
+ * this reports them the same way the video bus reports its own and names the
+ * chain, because "pipeline error" alone would not say which one stopped. Every
+ * error message is logged with its source element: the first one read is often
+ * the appsrc's "internal data stream error", which only says that something
+ * downstream failed - the element that actually rejected the data (opusdec)
+ * posts its own message right behind it. */
+static bool drain_audio_bus(Media *owner)
+{
+    if (!owner->audio_bus)
+        return true;
+
+    bool healthy = true;
+    GstMessage *msg;
+    while ((msg = gst_bus_pop(owner->audio_bus)) != NULL) {
+        switch (GST_MESSAGE_TYPE(msg)) {
+        case GST_MESSAGE_ERROR: {
+            GError *error = NULL;
+            gchar *debug = NULL;
+            gst_message_parse_error(msg, &error, &debug);
+            fprintf(stderr, "opennowlite: audio pipeline error from %s: %s\n",
+                    GST_MESSAGE_SRC_NAME(msg),
+                    error ? error->message : "unknown");
+            if (debug)
+                fprintf(stderr, "opennowlite: audio pipeline debug: %s\n",
+                        debug);
+            g_clear_error(&error);
+            g_free(debug);
+            healthy = false;
+            break;
+        }
+        case GST_MESSAGE_EOS:
+            fprintf(stderr, "opennowlite: audio pipeline end of stream\n");
+            healthy = false;
+            break;
+        default:
+            break;
+        }
+        gst_message_unref(msg);
+    }
+    return healthy;
+}
+
+/* An audio failure costs the sound, not the picture: the vendor queue may have
+ * taken two minutes, and throwing the session away because opusdec disliked one
+ * packet would make the user wait it out again. This stops the chain and
+ * leaves the video pipeline running. The elements are not freed here: the
+ * streamer's media thread may be inside gst_app_src_push_buffer right now, and
+ * keeping the objects alive until the program exits is what makes that safe. */
+static void media_audio_teardown(Media *owner)
+{
+    owner->audio_ready = false;
+    if (owner->audio)
+        gst_element_set_state((GstElement *)owner->audio, GST_STATE_NULL);
+    fprintf(stderr, "opennowlite: audio chain disabled, video continues\n");
+}
 
 static void media_push_video(Media *owner, const OpenNowStreamerEncodedMedia
                             *packet)
 {
     const guint8 *data = packet->data;
-    const size_t length = packet->data_len;
-    if (owner->video_used + length > owner->video_cap) {
-        fprintf(stderr, "opennowlite: video unit overflow: %zu\n", length);
-        owner->video_used = 0;
+    const gsize length = (gsize)packet->data_len;
+    GstBuffer *buffer = gst_buffer_new_allocate(NULL, length, NULL);
+    if (!buffer)
         return;
-    }
-    memcpy(owner->video_bytes + owner->video_used, data, length);
-    owner->video_used += length;
-    if (!packet->keyframe)
-        return;
-
-    GstBuffer *buffer = gst_buffer_new_wrapped(owner->video_bytes,
-                                              owner->video_used);
-    owner->video_used = 0;
+    gst_buffer_fill(buffer, 0, data, length);
 
     guint32 rate = packet->clock_rate_hz ? packet->clock_rate_hz : 90000u;
     guint64 pts = (guint64)packet->timestamp * GST_SECOND / rate;
@@ -1284,14 +1704,33 @@ static void media_push_video(Media *owner, const OpenNowStreamerEncodedMedia
     GST_BUFFER_DURATION(buffer) = GST_SECOND / 60u;
     if (gst_app_src_push_buffer(owner->video_source, buffer)
         != GST_FLOW_OK) {
-        /* appsrc owns the buffer it refused; it frees it when the element is
-         * torn down, so nothing here has to be released. */
-        fprintf(stderr, "opennowlite: video unit not queued\n");
+        /* appsrc owns the buffer it refused and releases it with the element,
+         * so nothing here has to be freed - but the unit is gone, and saying
+         * so on a clock is what keeps a slow decoder from reading as a
+         * silently frozen picture. */
+        ++owner->video_refused;
+        if (owner->video_refused == 1u)
+            fprintf(stderr, "opennowlite: video unit not queued\n");
+        else if (owner->video_refused % 600u == 0u)
+            fprintf(stderr, "opennowlite: video refused=%llu\n",
+                    (unsigned long long)owner->video_refused);
         return;
     }
     ++owner->video_units;
-    if (owner->video_units == 1)
+    if (owner->video_units == 1u) {
         fprintf(stderr, "opennowlite: encoded video unit 1\n");
+    } else if (owner->video_units % 600u == 0u) {
+        /* the queued number is the appsrc's own queue depth in bytes
+         * (`current-level-bytes`): at 60 units a second a chain that keeps up
+         * stays near one unit of picture (~30 KiB), and a chain that has
+         * fallen behind grows. `gst_app_src_get_size` is not this number - it
+         * answers the stream size the client declared, which this program
+         * never does, and it printed 18446744073709551615 (uint64 -1) on the
+         * seat. */
+        fprintf(stderr, "opennowlite: video units=%llu queued=%llu\n",
+                (unsigned long long)owner->video_units,
+                (unsigned long long)gst_app_src_get_current_level_bytes(owner->video_source));
+    }
 }
 
 static void media_push_audio(Media *owner,
@@ -1307,15 +1746,46 @@ static void media_push_audio(Media *owner,
     if (!owner->audio_base)
         owner->audio_base = pts + GST_SECOND;
     GST_BUFFER_PTS(buffer) = pts + GST_SECOND - owner->audio_base;
-    GST_BUFFER_DURATION(buffer) = GST_SECOND / 50u;   /* 20 ms per Opus frame */
+    /* 5 ms, not 20: the tap delivers ~200 packets a second against 60 video
+     * units a second, and the opennow layer's own audio queue says why
+     * ("the play queue holds 12 packets of 5 ms"), so an Opus frame off this
+     * wire is 5 ms of audio. Naming 20 ms made the audio chain run 4x faster
+     * than the clock it was handed. */
+    GST_BUFFER_DURATION(buffer) = GST_SECOND / 200u;
     if (gst_app_src_push_buffer(owner->audio_source, buffer)
         != GST_FLOW_OK) {
-        fprintf(stderr, "opennowlite: audio packet not queued\n");
+        ++owner->audio_refused;
+        if (owner->audio_refused == 1u)
+            fprintf(stderr, "opennowlite: audio packet not queued\n");
+        else if (owner->audio_refused % 1500u == 0u)
+            fprintf(stderr, "opennowlite: audio refused=%llu\n",
+                    (unsigned long long)owner->audio_refused);
         return;
     }
     ++owner->audio_units;
-    if (owner->audio_units == 1)
-        fprintf(stderr, "opennowlite: encoded audio packet 1\n");
+    if (owner->audio_units == 1u) {
+        fprintf(stderr,
+                "opennowlite: encoded audio packet 1 bytes=%zu channels=%u "
+                "rate=%u ts=%llu head=%02x %02x %02x %02x\n",
+                packet->data_len, packet->channels, packet->clock_rate_hz,
+                (unsigned long long)packet->timestamp,
+                packet->data_len > 0 ? packet->data[0] : 0,
+                packet->data_len > 1 ? packet->data[1] : 0,
+                packet->data_len > 2 ? packet->data[2] : 0,
+                packet->data_len > 3 ? packet->data[3] : 0);
+        /* One real packet, kept for an offline decode test: the same bytes
+         * through opusdec on this seat either decode or reproduce the failure
+         * without waiting out the vendor queue again. */
+        FILE *dump = fopen("/tmp/opennowlite-audio1.bin", "wb");
+        if (dump) {
+            fwrite(packet->data, 1, packet->data_len, dump);
+            fclose(dump);
+        }
+    } else if (owner->audio_units % 1500u == 0u) {
+        fprintf(stderr, "opennowlite: audio packets=%llu queued=%llu\n",
+                (unsigned long long)owner->audio_units,
+                (unsigned long long)gst_app_src_get_current_level_bytes(owner->audio_source));
+    }
 }
 
 /* This is the hand-off: the streamer does not decode or present anything when
@@ -1347,14 +1817,31 @@ static void on_encoded_media(const OpenNowStreamerEncodedMedia *packet, void *un
  * waylandsink, with no videoconvert between them. */
 static const char *video_caps_string =
     "video/x-h264,stream-format=byte-stream,alignment=au";
+/* The tap's Opus is raw (the transport already unwrapped RFC 2198 RED), so
+ * opusdec takes it directly. Family 0 is the plain mono/stereo mapping, and the
+ * channel count is left to the packet: pinning `channels=2` made the caps
+ * disagree with a mono stream, and opusdec reports that as a stream error on
+ * the first packet. Rate is 48 kHz by definition and comes from opusdec. */
 static const char *audio_caps_string =
-    "audio/x-opus,rate=48000,channels=2,channel-mapping-family=0";
+    "audio/x-opus,channel-mapping-family=0";
 
 /* appsrc with a live, non-seeking feed: `is-live` keeps the feed from ever
  * claiming end-of-stream, `do-timestamp=false` leaves the presentation
  * timestamps put on each pushed buffer intact (1.22's `format` property is
- * about segment events, not about this), and `block=true` with `max-bytes`
- * bounds the internal queue so a stalled feed cannot grow it. */
+ * about segment events, not about this), and `max-bytes` bounds the internal
+ * queue. `block` stays false, and that is the one thing here that must not be
+ * guessed at: with it true, a push past the bound blocks - and the push is
+ * made from the streamer's own media-callback thread, so a full queue stops
+ * the feed for the rest of the session. Measured on the r0.3 session that ran
+ * with it true: the picture froze after 7 min, the thread named
+ * `opennow-media-c` sat in a `g_cond_wait` inside `libgstapp-1.0.so`
+ * (`gdb` on the live process), the tallies stayed at
+ * `video units=25200`/`audio packets=85500` for the next 40 min, and the
+ * streamer's own `NVST rx-stats` line kept counting 35808 frames per 600 s -
+ * the vendor kept sending and the window never got it. A refused push is
+ * counted instead, and the queue's level is logged beside the tally so a
+ * decoder that falls behind reads as a growing `queued=` number and a stream
+ * of refusals rather than as a frozen picture. */
 static bool media_source_new(Media *owner, const char *caps_string,
                             guint max_bytes, gboolean is_audio)
 {
@@ -1369,37 +1856,39 @@ static bool media_source_new(Media *owner, const char *caps_string,
     }
     gst_app_src_set_caps(source, caps);
     gst_caps_unref(caps);
+    /* `format` is the one that mattered: an appsrc defaults to GST_FORMAT_BYTES,
+     * so its segment event says "bytes" and GstAudioDecoder ignores that
+     * segment and returns an error - measured on the seat: the same 89-byte
+     * packet decoded fine through opusdec when pushed with a time segment, and
+     * produced `appsrc1: Internal data stream error` (streaming stopped,
+     * reason error -5) with the default. The PTS on these buffers is already
+     * nanoseconds, so time is also the honest format. */
     g_object_set(element, "is-live", TRUE, "do-timestamp", FALSE,
-                 "block", TRUE, "max-bytes", (guint64)max_bytes, NULL);
+                 "block", FALSE, "max-bytes", (guint64)max_bytes,
+                 "format", GST_FORMAT_TIME, NULL);
     if (is_audio) {
         owner->audio_source = source;
         return true;
     }
     owner->video_source = source;
-    owner->video_cap = max_bytes;
-    owner->video_bytes = malloc(max_bytes);
-    if (!owner->video_bytes) {
-        gst_object_unref(element);
-        owner->video_source = NULL;
-        return false;
-    }
     return true;
 }
 
 /* Elements are probed rather than assumed: an absent Opus element means this
  * window simply has no audio, and saying so in the log is better than
- * refusing to show the game. */
+ * refusing to show the game. This seat's libgstopus.so (the
+ * gstreamer1.0-plugins-base-opus split package) ships only the decoder: the
+ * parser element upstream pairs with it is not built here, and is not needed,
+ * because every NVST audio packet is already one complete Opus frame and the
+ * appsrc hands them to opusdec one at a time. */
 static bool stream_new(struct lite *a)
 {
-    GstElementFactory *opusparse_factory = gst_element_factory_find("opusparse");
     GstElementFactory *opusdec_factory = gst_element_factory_find("opusdec");
-    media.audio_ready = opusparse_factory && opusdec_factory;
-    if (opusparse_factory)
-        gst_object_unref(opusparse_factory);
+    media.audio_ready = opusdec_factory != NULL;
     if (opusdec_factory)
         gst_object_unref(opusdec_factory);
     if (!media.audio_ready)
-        fprintf(stderr, "opennowlite: audio pipeline unavailable\n");
+        fprintf(stderr, "opennowlite: audio pipeline unavailable (no opusdec)\n");
 
     GstElement *vqueue = gst_element_factory_make("queue", NULL);
     GstElement *vparse = gst_element_factory_make("h264parse", NULL);
@@ -1471,16 +1960,27 @@ static bool stream_new(struct lite *a)
         media.audio_ready = false;
         return true;
     }
-    GstElement *sparse = gst_element_factory_make("opusparse", NULL);
     GstElement *decode = gst_element_factory_make("opusdec", NULL);
     GstElement *audiosink = gst_element_factory_make("autoaudiosink", NULL);
-    if (!sparse || !decode || !audiosink) {
-        if (sparse)
-            gst_object_unref(sparse);
+    /* A bounded queue in front of the decoder: the tap pushes one Opus frame
+     * every 5 ms, and if the sink ever stops consuming (preroll that does not
+     * finish, a device that disappears) the appsrc's own queue grew without
+     * bound - measured at 11.4 MB after 16 minutes while the sink sat in
+     * gst_base_sink_wait_preroll. A downstream-leaky queue keeps at most 200
+     * frames (one second of audio) and drops old ones instead of growing, so a
+     * broken sink costs one second of sound, not the process's memory. */
+    GstElement *queue = gst_element_factory_make("queue", NULL);
+    if (queue)
+        g_object_set(queue, "leaky", 2, "max-size-buffers", 200u,
+                     "max-size-bytes", (guint64)0,
+                     "max-size-time", (guint64)0, NULL);
+    if (!decode || !audiosink || !queue) {
         if (decode)
             gst_object_unref(decode);
         if (audiosink)
             gst_object_unref(audiosink);
+        if (queue)
+            gst_object_unref(queue);
         gst_object_unref(media.audio_source);
         media.audio_source = NULL;
         media.audio_ready = false;
@@ -1488,17 +1988,17 @@ static bool stream_new(struct lite *a)
     }
     media.audio = gst_pipeline_new("opennowlite-audio");
     if (!media.audio) {
-        gst_object_unref(sparse);
         gst_object_unref(decode);
         gst_object_unref(audiosink);
+        gst_object_unref(queue);
         gst_object_unref(media.audio_source);
         media.audio_source = NULL;
         media.audio_ready = false;
         return true;
     }
     gst_bin_add_many(GST_BIN(media.audio), (GstElement *)media.audio_source,
-                     sparse, decode, audiosink, NULL);
-    if (!gst_element_link_many((GstElement *)media.audio_source, sparse, decode,
+                     queue, decode, audiosink, NULL);
+    if (!gst_element_link_many((GstElement *)media.audio_source, queue, decode,
                                audiosink, NULL)) {
         fprintf(stderr, "opennowlite: audio chain could not be linked\n");
         gst_element_set_state(media.audio, GST_STATE_NULL);
@@ -1508,8 +2008,18 @@ static bool stream_new(struct lite *a)
         media.audio_ready = false;
         return true;
     }
-    gst_element_set_state(media.audio, GST_STATE_PLAYING);
-    fprintf(stderr, "opennowlite: audio pipeline ready\n");
+    /* The bus is kept so the main loop can report the audio chain's errors.
+     * Before this the audio pipeline's bus was never read, so a caps
+     * negotiation failure on opusdec looked exactly like a sink that never
+     * prerolled: no message, no sound, a growing appsrc. */
+    media.audio_bus = gst_element_get_bus(media.audio);
+    GstStateChangeReturn audio_change =
+        gst_element_set_state(media.audio, GST_STATE_PLAYING);
+    GstState audio_state = GST_STATE_VOID_PENDING;
+    GstStateChangeReturn audio_reached =
+        gst_element_get_state(media.audio, &audio_state, NULL, 2 * GST_SECOND);
+    fprintf(stderr, "opennowlite: audio pipeline ready set=%d reached=%d state=%d\n",
+            (int)audio_change, (int)audio_reached, (int)audio_state);
     return true;
 }
 
@@ -1627,23 +2137,39 @@ static void pointer_submit(void)
         int16_t dy = (int16_t)pointer_state.dy;
         pointer_state.dx = 0;
         pointer_state.dy = 0;
-        if (streamer.relative(streamer.engine, dx, dy) == OPENNOW_STREAMER_OK)
+        OpenNowStreamerStatus status =
+            streamer.relative(streamer.engine, dx, dy);
+        if (status == OPENNOW_STREAMER_OK) {
             ++app.submits;
+        } else if (app.input_refused++ == 0u) {
+            fprintf(stderr, "opennowlite-input: motion submit refused (%d)\n",
+                    (int)status);
+        }
     }
     if (pointer_state.wheel) {
         /* weston reports a wheel step as 120 units of a turn; GFN steps by one,
          * and scrolling away from the viewer is a positive step. */
         int16_t steps = (int16_t)(pointer_state.wheel / 120);
         pointer_state.wheel = 0;
-        if (steps && streamer.wheel(streamer.engine, 0, -steps)
-                        == OPENNOW_STREAMER_OK)
-            ++app.submits;
+        if (steps) {
+            OpenNowStreamerStatus status =
+                streamer.wheel(streamer.engine, 0, -steps);
+            if (status == OPENNOW_STREAMER_OK) {
+                ++app.submits;
+            } else if (app.input_refused++ == 0u) {
+                fprintf(stderr, "opennowlite-input: wheel submit refused (%d)\n",
+                        (int)status);
+            }
+        }
     }
 }
 
 static bool quit_key(uint32_t evdev, uint32_t modifier_mask)
 {
-    return evdev == 16 && (modifier_mask & 0x7u) == 0x7u;
+    /* Ctrl+Alt+Shift: xkb bits 0 (shift), 2 (control) and 3 (alt). The old
+     * mask 0x7 asked for shift, caps-lock and control, so the exit shortcut
+     * could never fire. */
+    return evdev == 16 && (modifier_mask & 0x0du) == 0x0du;
 }
 
 static void seat_key(uint32_t key_code, bool pressed)
@@ -1656,12 +2182,21 @@ static void seat_key(uint32_t key_code, bool pressed)
     if (!streamer.engine || !streamer.capture_active)
         return;
     uint16_t virtual_key = linux_virtual_key(evdev);
-    if (!virtual_key)
+    if (!virtual_key) {
+        if (app.input_refused++ == 0u)
+            fprintf(stderr, "opennowlite-input: no virtual key for evdev=%u\n",
+                    evdev);
         return;
-    if (streamer.key(streamer.engine, virtual_key,
-                    modifier_bits(app.modifier_mask), pressed)
-        == OPENNOW_STREAMER_OK)
+    }
+    OpenNowStreamerStatus status = streamer.key(streamer.engine, virtual_key,
+                                                modifier_bits(app.modifier_mask),
+                                                pressed);
+    if (status == OPENNOW_STREAMER_OK) {
         ++app.submits;
+    } else if (app.input_refused++ == 0u) {
+        fprintf(stderr, "opennowlite-input: key submit refused (%d)\n",
+                (int)status);
+    }
 }
 
 /* The absolute cursor is tracked either way so the first locked motion cannot
@@ -1677,12 +2212,20 @@ static void seat_motion(double x, double y)
     pointer_state.last_y = y;
 }
 
-/* weston numbers buttons 1 left, 2 right, 3 middle; GFN's button field is
- * 0 left, 1 right, 2 middle. */
+/* weston numbers buttons by their evdev code, not 1/2/3: a wl_pointer.button
+ * event carries BTN_LEFT 0x110 (272), BTN_RIGHT 0x111 (273) and BTN_MIDDLE
+ * 0x112 (274). Comparing the event against 1 meant the pointer never locked
+ * and every press was dropped by the `!locked` guard - measured on the seat:
+ * the log showed `pointer button=272 state=1` and never `pointer locked`, so
+ * the game received no click at all. The streamer then wants X11 numbers, not
+ * GFN's zero-based field: its own Windows raw-input path maps left to 1,
+ * middle to 2 and right to 3, and its FFI rejects anything outside 1..=5 with
+ * INVALID_CONFIG - measured: sending 0 for the left button produced
+ * `button submit refused (2)` on the first click after the lock. */
 static void seat_button(uint32_t button, uint32_t state)
 {
     bool pressed = state == 1;
-    if (button == 1 && pressed && !pointer_state.locked) {
+    if (button == 272 && pressed && !pointer_state.locked) {
         pointer_state.locked = true;
         pointer_cursor_hide();
         /* The click that locks the pointer is not forwarded, so locking cannot
@@ -1694,10 +2237,22 @@ static void seat_button(uint32_t button, uint32_t state)
         return;
     if (!streamer.engine || !streamer.capture_active)
         return;
-    uint8_t mapped = button == 1 ? 0u : button == 2 ? 1u : 2u;
-    if (streamer.button(streamer.engine, mapped, pressed)
-        == OPENNOW_STREAMER_OK)
+    uint8_t mapped;
+    switch (button) {
+    case 272: mapped = 1u; break;   /* BTN_LEFT   -> X11/OpenNOW 1 */
+    case 274: mapped = 2u; break;   /* BTN_MIDDLE -> 2 */
+    case 273: mapped = 3u; break;   /* BTN_RIGHT  -> 3 */
+    default:
+        return;
+    }
+    OpenNowStreamerStatus status =
+        streamer.button(streamer.engine, mapped, pressed);
+    if (status == OPENNOW_STREAMER_OK) {
         ++app.submits;
+    } else if (app.input_refused++ == 0u) {
+        fprintf(stderr, "opennowlite-input: button submit refused (%d)\n",
+                (int)status);
+    }
 }
 
 static void seat_wheel(int32_t value120)
@@ -1853,6 +2408,8 @@ int main(int argc, char **argv)
     while (running) {
         if (!drain_bus(&app))
             break;
+        if (!drain_audio_bus(&media))
+            media_audio_teardown(&media);
 
         wl_display_dispatch_pending(app.display);
         wl_display_flush(app.display);
@@ -1874,14 +2431,18 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "opennowlite: stopping keys=%lu motions=%lu submits=%lu\n",
-            app.keys, app.motions, app.submits);
+    fprintf(stderr, "opennowlite: stopping keys=%lu motions=%lu submits=%lu refused=%lu\n",
+            app.keys, app.motions, app.submits, app.input_refused);
     if (pointer_state.locked)
         pointer_cursor_show();
     engine_stop();
     core_shutdown(core_rpc);
     if (media.audio) {
         gst_element_set_state((GstElement *)media.audio, GST_STATE_NULL);
+        if (media.audio_bus) {
+            gst_object_unref(media.audio_bus);
+            media.audio_bus = NULL;
+        }
         gst_object_unref(media.audio);
         media.audio = NULL;
     }
