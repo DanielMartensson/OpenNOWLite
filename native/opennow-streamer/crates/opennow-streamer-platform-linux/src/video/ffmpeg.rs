@@ -1,0 +1,2804 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ptr;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use ffmpeg::codec;
+use ffmpeg::ffi;
+use ffmpeg::format::Pixel;
+use ffmpeg::frame;
+use ffmpeg::software::scaling::{context::Context as Scaler, flag::Flags as ScaleFlags};
+use ffmpeg_next as ffmpeg;
+
+use crate::{
+    ChromaLocation, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer, DecodedVideoFrame,
+    DmaBufFrame, DmaBufLayer, DmaBufObject, DmaBufPlane, EncodedVideoFrame, Error, FramePlane,
+    PixelFormat, Result, StreamFormat, Subsystem, VideoCodec, VulkanImage, VulkanVideoFrame,
+};
+
+use super::VideoDecoder;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FfmpegMode {
+    Vulkan,
+    Cuda,
+    Vaapi,
+    V4l2Request,
+    Software,
+}
+
+impl FfmpegMode {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Vulkan => "FFmpeg Vulkan Video",
+            Self::Cuda => "FFmpeg CUDA/NVDEC",
+            Self::Vaapi => "FFmpeg VAAPI",
+            Self::V4l2Request => "FFmpeg V4L2 request",
+            Self::Software => "FFmpeg software",
+        }
+    }
+
+    fn device_type(self) -> Option<ffi::AVHWDeviceType> {
+        match self {
+            Self::Vulkan => Some(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN),
+            Self::Cuda => Some(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA),
+            Self::Vaapi => Some(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI),
+            Self::V4l2Request => request_device_type(),
+            Self::Software => None,
+        }
+    }
+}
+
+fn request_device_type() -> Option<ffi::AVHWDeviceType> {
+    let device_type = unsafe { ffi::av_hwdevice_find_type_by_name(c"v4l2request".as_ptr()) };
+    (device_type != ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE).then_some(device_type)
+}
+
+pub(crate) struct FfmpegDecoder {
+    // The decoder must be dropped before `wanted_hw_format`; libavcodec may
+    // consult the callback opaque pointer during decoder teardown.
+    decoder: ffmpeg::decoder::Video,
+    wanted_hw_format: Option<Box<HardwareFormatSelection>>,
+    scaler: Option<Scaler>,
+    codec: VideoCodec,
+    mode: FfmpegMode,
+    configured_format: StreamFormat,
+    negotiated_format: StreamFormat,
+    pending_format_change: Option<StreamFormat>,
+    last_timestamp_us: u64,
+    zero_copy_active: bool,
+    zero_copy_unavailable_reported: bool,
+    #[cfg(feature = "vulkan")]
+    shared_device: Option<Arc<crate::SharedVulkanDevice>>,
+    #[cfg(feature = "vulkan")]
+    snapshot_pool: Option<super::vulkan_copy::VulkanCopyPool>,
+}
+
+struct HardwareFormatSelection {
+    pixel_format: ffi::AVPixelFormat,
+    exportable_vulkan_frames: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VaapiDevicePolicy {
+    Default,
+    Require(super::vaapi_probe::VaapiDepth),
+}
+
+fn vaapi_device_policy(
+    codec: VideoCodec,
+    mode: FfmpegMode,
+    pixel_format: PixelFormat,
+) -> VaapiDevicePolicy {
+    match (mode, pixel_format) {
+        (FfmpegMode::Vaapi, PixelFormat::P010) => {
+            VaapiDevicePolicy::Require(super::vaapi_probe::VaapiDepth::TenBit420)
+        }
+        (FfmpegMode::Vaapi, PixelFormat::Nv12)
+            if super::vaapi_probe::color_queries(codec).is_some() =>
+        {
+            VaapiDevicePolicy::Require(super::vaapi_probe::VaapiDepth::EightBit420)
+        }
+        _ => VaapiDevicePolicy::Default,
+    }
+}
+
+impl FfmpegDecoder {
+    pub(crate) fn supports_vaapi_color(codec: VideoCodec) -> super::VaapiColorSupport {
+        let Some(decoder) = initialize_ffmpeg()
+            .ok()
+            .and_then(|()| ffmpeg::decoder::find_by_name(native_decoder_name(codec)))
+        else {
+            return super::VaapiColorSupport::default();
+        };
+        if hardware_pixel_format(decoder, ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI).is_none() {
+            return super::VaapiColorSupport::default();
+        }
+        super::vaapi_probe::color_support(codec)
+    }
+
+    pub(crate) fn open(codec: VideoCodec, format: StreamFormat, mode: FfmpegMode) -> Result<Self> {
+        Self::open_internal(codec, format, mode, None)
+    }
+
+    #[cfg(feature = "vulkan")]
+    pub(crate) fn open_shared(
+        codec: VideoCodec,
+        format: StreamFormat,
+        device: Arc<crate::SharedVulkanDevice>,
+    ) -> Result<Self> {
+        if !device.supports_format(codec, format.pixel_format, format.width, format.height) {
+            return Err(Error::unavailable(
+                Subsystem::Vulkan,
+                "negotiated codec, depth, chroma or dimensions are unsupported by the shared Vulkan device",
+            ));
+        }
+        Self::open_internal(codec, format, FfmpegMode::Vulkan, Some(device))
+    }
+
+    fn open_internal(
+        codec: VideoCodec,
+        format: StreamFormat,
+        mode: FfmpegMode,
+        shared_device: Option<Arc<crate::SharedVulkanDevice>>,
+    ) -> Result<Self> {
+        if cfg!(feature = "hardware-only") && mode == FfmpegMode::Software {
+            return Err(Error::unavailable(
+                Subsystem::Ffmpeg,
+                "hardware-only build forbids software video decoding",
+            ));
+        }
+        format.validate()?;
+        if format.pixel_format.is_444() && (mode != FfmpegMode::Vulkan || shared_device.is_none()) {
+            return Err(Error::unavailable(
+                Subsystem::Ffmpeg,
+                "4:4:4 requires shared Vulkan Video GPU snapshots; CUDA, VAAPI and CPU conversion are unsupported",
+            ));
+        }
+        #[cfg(all(feature = "hardware-only", not(feature = "vulkan")))]
+        if mode == FfmpegMode::Vulkan {
+            return Err(Error::unavailable(
+                Subsystem::Vulkan,
+                "hardware-only Vulkan requires native GPU validation support",
+            ));
+        }
+        if mode == FfmpegMode::V4l2Request {
+            validate_request_profile(format)?;
+            if request_device_type().is_none() {
+                return Err(Error::unavailable(
+                    Subsystem::V4l2,
+                    "FFmpeg was built without the V4L2 request hwaccel",
+                ));
+            }
+            super::v4l2_request::probe(codec, format.width, format.height)
+                .map_err(|reason| Error::unavailable(Subsystem::V4l2, reason))?;
+        }
+        if (format.color_transfer != ColorTransfer::Sdr || format.pixel_format.is_ten_bit())
+            && matches!(mode, FfmpegMode::Cuda | FfmpegMode::Software)
+        {
+            return Err(Error::unavailable(
+                Subsystem::Ffmpeg,
+                "HDR/10-bit requires Vulkan Video or VAAPI zero-copy decoding",
+            ));
+        }
+        initialize_ffmpeg()?;
+        take_ffmpeg_log();
+        let decoder_definition = match (mode, codec) {
+            (FfmpegMode::Software, VideoCodec::Av1) => ["libdav1d", "libaom-av1"]
+                .into_iter()
+                .find_map(ffmpeg::decoder::find_by_name),
+            (FfmpegMode::Software, _) => ffmpeg::decoder::find(codec_id(codec)),
+            _ => ffmpeg::decoder::find_by_name(native_decoder_name(codec)),
+        }
+        .ok_or_else(|| {
+            Error::unavailable(
+                Subsystem::Ffmpeg,
+                if mode == FfmpegMode::Software && codec == VideoCodec::Av1 {
+                    "software AV1 requires FFmpeg built with libdav1d or libaom-av1".to_owned()
+                } else {
+                    format!("FFmpeg was built without the {} decoder", codec.label())
+                },
+            )
+        })?;
+        let mut context = codec::Context::new_with_codec(decoder_definition);
+        unsafe {
+            let raw = context.as_mut_ptr();
+            (*raw).width = format.width as i32;
+            (*raw).height = format.height as i32;
+            if mode == FfmpegMode::Software {
+                // Frame threading holds about one frame per worker before the
+                // first output. Slice threading spends the same cores inside a
+                // single frame, which is the delay users see against the old client.
+                (*raw).thread_count = software_decode_thread_count();
+                (*raw).thread_type = ffi::FF_THREAD_SLICE;
+                (*raw).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+            } else {
+                (*raw).thread_count = 1;
+            }
+            if mode == FfmpegMode::V4l2Request {
+                (*raw).extra_hw_frames = 6;
+            }
+        }
+
+        let mut wanted_hw_format = None;
+        let vaapi_device = match vaapi_device_policy(codec, mode, format.pixel_format) {
+            VaapiDevicePolicy::Require(depth) => Some(
+                super::vaapi_probe::device_for_profile(codec, depth).ok_or_else(|| {
+                    Error::unavailable(
+                        Subsystem::VaApi,
+                        match depth {
+                            super::vaapi_probe::VaapiDepth::EightBit420 => {
+                                "no VAAPI decode profile supports the requested 8-bit 4:2:0 format"
+                            }
+                            super::vaapi_probe::VaapiDepth::TenBit420 => {
+                                "no VAAPI decode profile supports the requested 10-bit 4:2:0 format"
+                            }
+                        },
+                    )
+                })?,
+            ),
+            VaapiDevicePolicy::Default => None,
+        };
+        let device_path = vaapi_device
+            .as_ref()
+            .map_or(ptr::null(), |path| path.as_ptr());
+        if let Some(device_type) = mode.device_type() {
+            let pixel_format =
+                hardware_pixel_format(decoder_definition, device_type).ok_or_else(|| {
+                    Error::unavailable(
+                        Subsystem::Ffmpeg,
+                        format!(
+                            "{} does not expose {} decode through libavcodec",
+                            mode.label(),
+                            codec.label()
+                        ),
+                    )
+                })?;
+            let mut device = ptr::null_mut();
+            let mut options = ptr::null_mut();
+            if mode == FfmpegMode::Vulkan {
+                unsafe {
+                    ffi::av_dict_set(
+                        &mut options,
+                        c"instance_extensions".as_ptr(),
+                        c"VK_KHR_surface+VK_KHR_xlib_surface+VK_KHR_wayland_surface".as_ptr(),
+                        0,
+                    );
+                    ffi::av_dict_set(
+                        &mut options,
+                        c"device_extensions".as_ptr(),
+                        c"VK_KHR_swapchain".as_ptr(),
+                        0,
+                    );
+                }
+            }
+            #[cfg(feature = "vulkan")]
+            let create_result = if let Some(shared) = shared_device.as_ref() {
+                device = shared.retain();
+                if device.is_null() { -12 } else { 0 }
+            } else {
+                unsafe {
+                    ffi::av_hwdevice_ctx_create(&mut device, device_type, device_path, options, 0)
+                }
+            };
+            #[cfg(not(feature = "vulkan"))]
+            let create_result = unsafe {
+                ffi::av_hwdevice_ctx_create(&mut device, device_type, device_path, options, 0)
+            };
+            unsafe { ffi::av_dict_free(&mut options) };
+            if create_result < 0 || device.is_null() {
+                return Err(ffmpeg_error(
+                    format!("failed to create the {} device", mode.label()),
+                    create_result,
+                ));
+            }
+            #[cfg(all(feature = "hardware-only", feature = "vulkan"))]
+            if mode == FfmpegMode::Vulkan {
+                let validation = (|| {
+                    use ash::vk::Handle;
+                    let entry = unsafe { ash::Entry::load() }.map_err(|error| {
+                        Error::unavailable(Subsystem::Vulkan, error.to_string())
+                    })?;
+                    let hardware = unsafe { &*(*device).data.cast::<ffi::AVHWDeviceContext>() };
+                    let vulkan = unsafe { &*hardware.hwctx.cast::<ffi::AVVulkanDeviceContext>() };
+                    let instance = unsafe {
+                        ash::Instance::load(
+                            entry.static_fn(),
+                            ash::vk::Instance::from_raw(vulkan.inst as u64),
+                        )
+                    };
+                    let properties = unsafe {
+                        instance.get_physical_device_properties(ash::vk::PhysicalDevice::from_raw(
+                            vulkan.phys_dev as u64,
+                        ))
+                    };
+                    if !crate::vulkan_device::physical_device_allowed(properties.device_type) {
+                        return Err(Error::unavailable(
+                            Subsystem::Vulkan,
+                            "hardware-only build forbids software Vulkan devices",
+                        ));
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = validation {
+                    unsafe { ffi::av_buffer_unref(&mut device) };
+                    return Err(error);
+                }
+            }
+            let mut selected = Box::new(HardwareFormatSelection {
+                pixel_format,
+                exportable_vulkan_frames: false,
+            });
+            unsafe {
+                let raw = context.as_mut_ptr();
+                (*raw).hw_device_ctx = ffi::av_buffer_ref(device);
+                (*raw).get_format = Some(select_hardware_format);
+                (*raw).opaque = (&mut *selected as *mut HardwareFormatSelection).cast();
+                ffi::av_buffer_unref(&mut device);
+                if (*raw).hw_device_ctx.is_null() {
+                    return Err(Error::backend(
+                        Subsystem::Ffmpeg,
+                        format!("failed to retain the {} device", mode.label()),
+                    ));
+                }
+            }
+            wanted_hw_format = Some(selected);
+        }
+
+        if mode == FfmpegMode::Cuda {
+            let cuda = unsafe {
+                let device = (*context.as_ptr()).hw_device_ctx;
+                let hardware = (*device).data.cast::<ffi::AVHWDeviceContext>();
+                &*(*hardware).hwctx.cast::<ffi::AVCUDADeviceContext>()
+            };
+            super::cuda_probe::validate(cuda.cuda_ctx, codec, format)
+                .map_err(|reason| Error::unavailable(Subsystem::Ffmpeg, reason))?;
+        }
+
+        let decoder = context
+            .decoder()
+            .open_as(decoder_definition)
+            .and_then(|opened| opened.video())
+            .map_err(|error| {
+                Error::backend(
+                    Subsystem::Ffmpeg,
+                    with_ffmpeg_log(format!(
+                        "{} {} decoder initialization failed: {error}",
+                        mode.label(),
+                        codec.label()
+                    )),
+                )
+            })?;
+        Ok(Self {
+            decoder,
+            wanted_hw_format,
+            scaler: None,
+            codec,
+            mode,
+            configured_format: format,
+            negotiated_format: format,
+            pending_format_change: None,
+            last_timestamp_us: 0,
+            zero_copy_active: false,
+            zero_copy_unavailable_reported: false,
+            #[cfg(feature = "vulkan")]
+            shared_device,
+            #[cfg(feature = "vulkan")]
+            snapshot_pool: None,
+        })
+    }
+
+    pub(crate) fn probe(
+        codec: VideoCodec,
+        mode: FfmpegMode,
+    ) -> std::result::Result<String, String> {
+        let format = StreamFormat::video_default(1920, 1080).map_err(|error| error.to_string())?;
+        let mut decoder = Self::open(codec, format, mode).map_err(|error| error.to_string())?;
+        if mode == FfmpegMode::Cuda {
+            decoder.probe_frame().map_err(|error| error.to_string())?;
+        }
+        Ok(format!(
+            "{} {} via libavcodec {}",
+            decoder.mode.label(),
+            decoder.codec.label(),
+            ffmpeg::codec::version()
+        ))
+    }
+
+    fn probe_frame(&mut self) -> Result<()> {
+        let data: &[u8] = match self.codec {
+            VideoCodec::H264 => include_bytes!("fixtures/cuda_probe.h264"),
+            VideoCodec::H265 => include_bytes!("fixtures/cuda_probe.hevc"),
+            VideoCodec::Av1 => include_bytes!("fixtures/cuda_probe.obu"),
+        };
+        let packet = ffmpeg::Packet::copy(data);
+        self.decoder
+            .send_packet(&packet)
+            .map_err(|error| self.decode_error("probe packet submission", error))?;
+        self.decoder
+            .send_eof()
+            .map_err(|error| self.decode_error("probe drain", error))?;
+        let mut decoded = frame::Video::empty();
+        self.decoder
+            .receive_frame(&mut decoded)
+            .map_err(|error| self.decode_error("probe frame receive", error))?;
+        if let Some(wanted) = self.wanted_hw_format.as_ref() {
+            if decoded.format() != Pixel::from(wanted.pixel_format) {
+                return Err(Error::backend(
+                    Subsystem::Ffmpeg,
+                    format!(
+                        "{} probe did not produce a hardware frame",
+                        self.mode.label()
+                    ),
+                ));
+            }
+        }
+        if decoded.width() != 1920 || decoded.height() != 1080 {
+            return Err(Error::backend(
+                Subsystem::Ffmpeg,
+                "decoder probe did not produce the expected 1920x1080 frame",
+            ));
+        }
+        Ok(())
+    }
+
+    fn drain(&mut self, draining: bool) -> Result<Vec<DecodedVideoFrame>> {
+        let mut frames = Vec::new();
+        loop {
+            let mut decoded = frame::Video::empty();
+            match self.decoder.receive_frame(&mut decoded) {
+                Ok(()) => frames.push(self.convert_frame(&decoded)?),
+                Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => break,
+                Err(ffmpeg::Error::Eof) if draining => break,
+                Err(error) => {
+                    return Err(self.decode_error("frame receive", error));
+                }
+            }
+        }
+        Ok(frames)
+    }
+
+    fn decode_error(&self, operation: &str, error: ffmpeg::Error) -> Error {
+        let reason = with_ffmpeg_log(format!(
+            "{} {} {operation} failed: {error}",
+            self.mode.label(),
+            self.codec.label()
+        ));
+        if self.mode == FfmpegMode::V4l2Request && error == ffmpeg::Error::InvalidData {
+            Error::ReferenceLost {
+                subsystem: Subsystem::V4l2,
+                reason,
+            }
+        } else {
+            Error::backend(Subsystem::Ffmpeg, reason)
+        }
+    }
+
+    fn convert_frame(&mut self, decoded: &frame::Video) -> Result<DecodedVideoFrame> {
+        reject_corrupt_frame(
+            decoded,
+            if self.mode == FfmpegMode::V4l2Request {
+                Subsystem::V4l2
+            } else {
+                Subsystem::Ffmpeg
+            },
+        )?;
+        if self.mode == FfmpegMode::V4l2Request {
+            let output =
+                retain_request_frame(decoded, self.last_timestamp_us, self.negotiated_format)?;
+            if output.format != self.configured_format {
+                self.configured_format = output.format;
+                self.pending_format_change = Some(output.format);
+            }
+            return Ok(output);
+        }
+        let metadata = decoded_metadata(decoded, self.negotiated_format);
+        #[cfg(feature = "vulkan")]
+        if let Some(device) = self.shared_device.as_ref() {
+            if decoded.format() != Pixel::VULKAN {
+                return Err(Error::backend(
+                    Subsystem::Vulkan,
+                    "embedded Vulkan decoder returned a non-GPU frame",
+                ));
+            }
+            let pixel_format = decoded_hardware_pixel_format(decoded)?;
+            if pixel_format != self.configured_format.pixel_format
+                || !device.supports_format(
+                    self.codec,
+                    pixel_format,
+                    decoded.width(),
+                    decoded.height(),
+                )
+            {
+                return Err(Error::unavailable(
+                    Subsystem::Vulkan,
+                    "decoded Vulkan format differs from the supported negotiated profile",
+                ));
+            }
+            if self.snapshot_pool.is_none() {
+                self.snapshot_pool =
+                    Some(super::vulkan_copy::VulkanCopyPool::new(Arc::clone(device))?);
+            }
+            let mut output = self
+                .snapshot_pool
+                .as_mut()
+                .expect("initialized snapshot pool")
+                .copy(decoded, self.last_timestamp_us)?;
+            output.format = StreamFormat {
+                width: output.format.width,
+                height: output.format.height,
+                pixel_format: output.format.pixel_format,
+                ..metadata
+            };
+            if output.format != self.configured_format {
+                self.configured_format = output.format;
+                self.pending_format_change = Some(output.format);
+            }
+            return Ok(output);
+        }
+        let selected_hardware = self
+            .wanted_hw_format
+            .as_deref()
+            .is_some_and(|selection| Pixel::from(selection.pixel_format) == decoded.format());
+        let actual_pixel = if selected_hardware {
+            decoded_hardware_software_format(decoded)?
+        } else {
+            decoded.format()
+        };
+        if matches!(
+            ffi::AVPixelFormat::from(actual_pixel),
+            ffi::AVPixelFormat::AV_PIX_FMT_NV24 | ffi::AVPixelFormat::AV_PIX_FMT_P410LE
+        ) {
+            return Err(Error::unavailable(
+                Subsystem::Ffmpeg,
+                "4:4:4 hardware output requires shared Vulkan Video GPU snapshots",
+            ));
+        }
+        let allow_cpu_conversion = cpu_conversion_allowed(metadata, actual_pixel);
+        let vaapi_cpu_transfer = vaapi_cpu_transfer_allowed(self.mode, metadata, actual_pixel);
+        if matches!(self.mode, FfmpegMode::Vulkan | FfmpegMode::Vaapi) && selected_hardware {
+            let output = if self.mode == FfmpegMode::Vulkan && allow_cpu_conversion {
+                let direct_vulkan =
+                    map_vulkan_frame_direct(decoded, self.last_timestamp_us, metadata)
+                        .ok()
+                        .and_then(|frame| frame.vulkan);
+                match map_hardware_frame_to_dmabuf(
+                    decoded,
+                    self.last_timestamp_us,
+                    metadata,
+                    self.mode,
+                ) {
+                    Ok(mut frame) => {
+                        frame.vulkan = direct_vulkan;
+                        if !self.zero_copy_active {
+                            eprintln!(
+                                "Vulkan Video frames expose same-device and DRM PRIME/DMA-BUF paths"
+                            );
+                            self.zero_copy_active = true;
+                        }
+                        Some(frame)
+                    }
+                    Err(error) => {
+                        if !self.zero_copy_unavailable_reported {
+                            eprintln!(
+                                "Vulkan Video DMA-BUF export unavailable; using bounded CPU transfer: {error}"
+                            );
+                            self.zero_copy_unavailable_reported = true;
+                        }
+                        None
+                    }
+                }
+            } else if self.mode == FfmpegMode::Vulkan {
+                Some(map_vulkan_frame_direct(
+                    decoded,
+                    self.last_timestamp_us,
+                    metadata,
+                )?)
+            } else if vaapi_cpu_transfer && self.zero_copy_unavailable_reported {
+                None
+            } else {
+                match map_hardware_frame_to_dmabuf(
+                    decoded,
+                    self.last_timestamp_us,
+                    metadata,
+                    self.mode,
+                ) {
+                    Ok(frame) => Some(frame),
+                    Err(error) if vaapi_cpu_transfer => {
+                        eprintln!(
+                            "FFmpeg VAAPI DMA-BUF export unavailable; using bounded NV12 CPU transfer: {error}"
+                        );
+                        self.zero_copy_unavailable_reported = true;
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            if let Some(output) = output {
+                if self.mode == FfmpegMode::Vaapi
+                    && output.format.pixel_format != self.negotiated_format.pixel_format
+                {
+                    return Err(Error::unavailable(
+                        Subsystem::VaApi,
+                        "VAAPI output depth differs from the negotiated decode format",
+                    ));
+                }
+                output.format.validate()?;
+                if output.format != self.configured_format {
+                    self.configured_format = output.format;
+                    self.pending_format_change = Some(output.format);
+                }
+                return Ok(output);
+            }
+        }
+        if !allow_cpu_conversion {
+            return Err(Error::unavailable(
+                Subsystem::Ffmpeg,
+                "HDR/10-bit/4:4:4 frame has no supported zero-copy decode path",
+            ));
+        }
+        let software_frame;
+        let source = if self
+            .wanted_hw_format
+            .as_deref()
+            .is_some_and(|selection| Pixel::from(selection.pixel_format) == decoded.format())
+        {
+            let mut transferred = frame::Video::empty();
+            let transfer_result = unsafe {
+                ffi::av_hwframe_transfer_data(transferred.as_mut_ptr(), decoded.as_ptr(), 0)
+            };
+            if transfer_result < 0 {
+                return Err(ffmpeg_error(
+                    format!("{} frame download failed", self.mode.label()),
+                    transfer_result,
+                ));
+            }
+            unsafe {
+                ffi::av_frame_copy_props(transferred.as_mut_ptr(), decoded.as_ptr());
+            }
+            software_frame = transferred;
+            &software_frame
+        } else {
+            decoded
+        };
+        if !cpu_conversion_allowed(metadata, source.format()) {
+            return Err(Error::unavailable(
+                Subsystem::Ffmpeg,
+                "downloaded video format cannot be presented as 8-bit 4:2:0 SDR",
+            ));
+        }
+
+        let width = source.width().max(1);
+        let height = source.height().max(1);
+        // Software H.264 emits planar 4:2:0. Packing that into NV12 is a copy
+        // plus a chroma interleave. swscale's bilinear scaler does the same
+        // conversion with a much larger per-frame cost on CPUs that have no
+        // hardware decoder.
+        let planes = if let Some(planes) = direct_cpu_nv12_planes(source)? {
+            planes
+        } else {
+            let scaler_changed = self.scaler.as_ref().is_none_or(|scaler| {
+                scaler.input().format != source.format()
+                    || scaler.input().width != width
+                    || scaler.input().height != height
+            });
+            if scaler_changed {
+                self.scaler = Some(
+                    Scaler::get(
+                        source.format(),
+                        width,
+                        height,
+                        Pixel::NV12,
+                        width,
+                        height,
+                        ScaleFlags::FAST_BILINEAR,
+                    )
+                    .map_err(|error| {
+                        Error::backend(
+                            Subsystem::Ffmpeg,
+                            format!("NV12 conversion setup failed: {error}"),
+                        )
+                    })?,
+                );
+            }
+            let mut frame = frame::Video::empty();
+            self.scaler
+                .as_mut()
+                .expect("scaler was initialized")
+                .run(source, &mut frame)
+                .map_err(|error| {
+                    Error::backend(
+                        Subsystem::Ffmpeg,
+                        format!("NV12 conversion failed: {error}"),
+                    )
+                })?;
+            tight_nv12_planes(&frame)?
+        };
+
+        let output_format = StreamFormat {
+            width,
+            height,
+            pixel_format: PixelFormat::Nv12,
+            ..metadata
+        };
+        output_format.validate()?;
+        if output_format != self.configured_format {
+            self.configured_format = output_format;
+            self.pending_format_change = Some(output_format);
+        }
+        let timestamp_us = decoded
+            .pts()
+            .and_then(|timestamp| u64::try_from(timestamp).ok())
+            .unwrap_or(self.last_timestamp_us);
+        Ok(DecodedVideoFrame {
+            format: output_format,
+            planes,
+            dmabuf: None,
+            vulkan: None,
+            timestamp_us,
+        })
+    }
+}
+
+fn map_vulkan_frame_direct(
+    decoded: &frame::Video,
+    fallback_timestamp_us: u64,
+    metadata: StreamFormat,
+) -> Result<DecodedVideoFrame> {
+    let (vulkan_frame, vulkan_frames, device_context, vulkan_device) = unsafe {
+        let raw = decoded.as_ptr();
+        let vulkan_frame = (*raw).data[0].cast::<ffi::AVVkFrame>();
+        let frames_ref = (*raw).hw_frames_ctx;
+        if vulkan_frame.is_null() || frames_ref.is_null() || (*frames_ref).data.is_null() {
+            return Err(Error::backend(
+                Subsystem::Ffmpeg,
+                "Vulkan Video frame has no hardware context",
+            ));
+        }
+        let frames_context = (*frames_ref).data.cast::<ffi::AVHWFramesContext>();
+        let vulkan_frames = (*frames_context).hwctx.cast::<ffi::AVVulkanFramesContext>();
+        let device_context = (*frames_context).device_ctx;
+        if vulkan_frames.is_null() || device_context.is_null() {
+            return Err(Error::backend(
+                Subsystem::Ffmpeg,
+                "Vulkan Video frame has incomplete hardware metadata",
+            ));
+        }
+        let vulkan_device = (*device_context).hwctx.cast::<ffi::AVVulkanDeviceContext>();
+        if vulkan_device.is_null() {
+            return Err(Error::backend(
+                Subsystem::Ffmpeg,
+                "Vulkan Video frame has no Vulkan device",
+            ));
+        }
+        (vulkan_frame, vulkan_frames, device_context, vulkan_device)
+    };
+    let image_count = unsafe {
+        (*vulkan_frame)
+            .img
+            .iter()
+            .position(|image| *image == 0)
+            .unwrap_or((*vulkan_frame).img.len())
+    };
+    if image_count == 0 || image_count > 2 {
+        return Err(Error::unavailable(
+            Subsystem::Ffmpeg,
+            format!("unsupported Vulkan Video image count {image_count}"),
+        ));
+    }
+    let width = decoded.width().max(1);
+    let height = decoded.height().max(1);
+    let mut images = Vec::with_capacity(image_count);
+    for index in 0..image_count {
+        let (plane_width, plane_height) = if index == 0 || image_count == 1 {
+            (width, height)
+        } else {
+            (width / 2, height / 2)
+        };
+        images.push(VulkanImage {
+            image: unsafe { (*vulkan_frame).img[index] },
+            format: unsafe { (*vulkan_frames).format[index] },
+            width: plane_width,
+            height: plane_height,
+            layout: unsafe { (*vulkan_frame).layout[index] },
+            access: unsafe { (*vulkan_frame).access[index] },
+            semaphore: unsafe { (*vulkan_frame).sem[index] },
+            semaphore_value: unsafe { (*vulkan_frame).sem_value[index] },
+            queue_family: unsafe { (*vulkan_frame).queue_family[index] },
+        });
+    }
+    let queue_count = unsafe { (*vulkan_device).nb_qf.max(0) as usize };
+    let queue_families =
+        unsafe { &(&(*vulkan_device).qf)[..queue_count.min((*vulkan_device).qf.len())] }
+            .iter()
+            .filter_map(|family| u32::try_from(family.idx).ok())
+            .collect::<Vec<_>>();
+    let mut retained = frame::Video::empty();
+    if unsafe { ffi::av_frame_ref(retained.as_mut_ptr(), decoded.as_ptr()) } < 0 {
+        return Err(Error::backend(
+            Subsystem::Ffmpeg,
+            "failed to retain Vulkan Video frame for presentation",
+        ));
+    }
+    let device = unsafe {
+        VulkanVideoFrame::new(
+            (*vulkan_device).inst as usize,
+            (*vulkan_device).phys_dev as usize,
+            (*vulkan_device).act_dev as usize,
+            queue_families,
+            (*vulkan_frames).usage as u32,
+            (*vulkan_frames).img_flags,
+            images,
+            device_context as usize,
+            (*vulkan_device).lock_queue.map(|callback| {
+                std::mem::transmute::<
+                    unsafe extern "C" fn(*mut ffi::AVHWDeviceContext, u32, u32),
+                    unsafe extern "C" fn(*mut std::ffi::c_void, u32, u32),
+                >(callback)
+            }),
+            (*vulkan_device).unlock_queue.map(|callback| {
+                std::mem::transmute::<
+                    unsafe extern "C" fn(*mut ffi::AVHWDeviceContext, u32, u32),
+                    unsafe extern "C" fn(*mut std::ffi::c_void, u32, u32),
+                >(callback)
+            }),
+            Arc::new(retained),
+        )
+    };
+    let device = if metadata.color_transfer == ColorTransfer::Sdr
+        && decoded_hardware_pixel_format(decoded)? == PixelFormat::Nv12
+    {
+        device.with_cpu_nv12_fallback(vulkan_cpu_nv12_fallback(decoded)?)
+    } else {
+        device
+    };
+    let output_format = StreamFormat {
+        width,
+        height,
+        pixel_format: decoded_hardware_pixel_format(decoded)?,
+        ..metadata
+    };
+    let timestamp_us = decoded
+        .pts()
+        .and_then(|timestamp| u64::try_from(timestamp).ok())
+        .unwrap_or(fallback_timestamp_us);
+    let output = DecodedVideoFrame {
+        format: output_format,
+        planes: Vec::new(),
+        dmabuf: None,
+        vulkan: Some(Arc::new(device)),
+        timestamp_us,
+    };
+    output.validate()?;
+    Ok(output)
+}
+
+fn vulkan_cpu_nv12_fallback(
+    decoded: &frame::Video,
+) -> Result<Arc<dyn Fn() -> Result<Vec<FramePlane>> + Send + Sync>> {
+    let mut retained = frame::Video::empty();
+    if unsafe { ffi::av_frame_ref(retained.as_mut_ptr(), decoded.as_ptr()) } < 0 {
+        return Err(Error::backend(
+            Subsystem::Ffmpeg,
+            "failed to retain Vulkan frame for CPU fallback",
+        ));
+    }
+    let retained = Mutex::new(retained);
+    Ok(Arc::new(move || {
+        let source = retained.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut transferred = frame::Video::empty();
+        let transfer_result =
+            unsafe { ffi::av_hwframe_transfer_data(transferred.as_mut_ptr(), source.as_ptr(), 0) };
+        if transfer_result < 0 {
+            return Err(ffmpeg_error(
+                "Vulkan frame CPU fallback download failed".to_owned(),
+                transfer_result,
+            ));
+        }
+        if let Some(planes) = direct_cpu_nv12_planes(&transferred)? {
+            return Ok(planes);
+        }
+        let width = transferred.width().max(1);
+        let height = transferred.height().max(1);
+        let mut scaler = Scaler::get(
+            transferred.format(),
+            width,
+            height,
+            Pixel::NV12,
+            width,
+            height,
+            ScaleFlags::FAST_BILINEAR,
+        )
+        .map_err(|error| {
+            Error::backend(
+                Subsystem::Ffmpeg,
+                format!("Vulkan CPU fallback conversion setup failed: {error}"),
+            )
+        })?;
+        let mut output = frame::Video::empty();
+        scaler.run(&transferred, &mut output).map_err(|error| {
+            Error::backend(
+                Subsystem::Ffmpeg,
+                format!("Vulkan CPU fallback NV12 conversion failed: {error}"),
+            )
+        })?;
+        tight_nv12_planes(&output)
+    }))
+}
+
+fn reject_corrupt_frame(decoded: &frame::Video, subsystem: Subsystem) -> Result<()> {
+    unsafe {
+        let raw = &*decoded.as_ptr();
+        if raw.flags & ffi::AV_FRAME_FLAG_CORRUPT != 0 || raw.decode_error_flags != 0 {
+            return Err(Error::ReferenceLost {
+                subsystem,
+                reason: "decode failed; refusing a corrupt reference frame".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn software_decode_thread_count() -> i32 {
+    let cores = std::thread::available_parallelism()
+        .map(|count| i32::try_from(count.get()).unwrap_or(i32::MAX))
+        .unwrap_or(2);
+    cores.clamp(2, 4)
+}
+
+fn direct_cpu_nv12_planes(source: &frame::Video) -> Result<Option<Vec<FramePlane>>> {
+    let width = usize::try_from(source.width()).unwrap_or(0);
+    let height = usize::try_from(source.height()).unwrap_or(0);
+    if width == 0 || height == 0 {
+        return Err(Error::backend(
+            Subsystem::Ffmpeg,
+            "decoded frame has no dimensions",
+        ));
+    }
+    if source.format() == Pixel::NV12 {
+        return tight_nv12_planes(source).map(Some);
+    }
+    let planar_420 = source.format() == Pixel::YUV420P || source.format() == Pixel::YUVJ420P;
+    if planar_420 && width % 2 == 0 && height % 2 == 0 {
+        return pack_yuv420p(source, width, height).map(Some);
+    }
+    Ok(None)
+}
+
+fn tight_nv12_planes(source: &frame::Video) -> Result<Vec<FramePlane>> {
+    let width = usize::try_from(source.width().max(1)).unwrap_or(0);
+    let height = usize::try_from(source.height().max(1)).unwrap_or(0);
+    let chroma_rows = height / 2;
+    let luma = pack_plane(source.data(0), source.stride(0), width, height)?;
+    let chroma = pack_plane(source.data(1), source.stride(1), width, chroma_rows)?;
+    Ok(vec![luma, chroma])
+}
+
+fn pack_yuv420p(source: &frame::Video, width: usize, height: usize) -> Result<Vec<FramePlane>> {
+    let chroma_width = width / 2;
+    let chroma_rows = height / 2;
+    let luma = pack_plane(source.data(0), source.stride(0), width, height)?;
+    let chroma = interleave_chroma(
+        source.data(1),
+        source.stride(1),
+        source.data(2),
+        source.stride(2),
+        chroma_width,
+        chroma_rows,
+    )?;
+    Ok(vec![luma, chroma])
+}
+
+fn pack_plane(src: &[u8], stride: usize, row_bytes: usize, rows: usize) -> Result<FramePlane> {
+    if row_bytes == 0 || rows == 0 || stride < row_bytes {
+        return Err(Error::backend(
+            Subsystem::Ffmpeg,
+            "decoded plane layout is incomplete",
+        ));
+    }
+    let src_len = stride
+        .checked_mul(rows)
+        .ok_or_else(|| Error::backend(Subsystem::Ffmpeg, "decoded plane size overflow"))?;
+    let dst_len = row_bytes
+        .checked_mul(rows)
+        .ok_or_else(|| Error::backend(Subsystem::Ffmpeg, "NV12 plane size overflow"))?;
+    if src.len() < src_len {
+        return Err(Error::backend(
+            Subsystem::Ffmpeg,
+            "decoded plane is shorter than its stride",
+        ));
+    }
+    let mut data = Vec::<u8>::with_capacity(dst_len);
+    unsafe {
+        let dst = data.as_mut_ptr();
+        if stride == row_bytes {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst, dst_len);
+        } else {
+            for row in 0..rows {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr().add(row * stride),
+                    dst.add(row * row_bytes),
+                    row_bytes,
+                );
+            }
+        }
+        data.set_len(dst_len);
+    }
+    Ok(FramePlane {
+        data: Arc::from(data),
+        stride: row_bytes,
+        rows,
+    })
+}
+
+fn interleave_chroma(
+    u_plane: &[u8],
+    u_stride: usize,
+    v_plane: &[u8],
+    v_stride: usize,
+    chroma_width: usize,
+    rows: usize,
+) -> Result<FramePlane> {
+    if chroma_width == 0 || rows == 0 || u_stride < chroma_width || v_stride < chroma_width {
+        return Err(Error::backend(
+            Subsystem::Ffmpeg,
+            "decoded chroma layout is incomplete",
+        ));
+    }
+    let u_len = u_stride
+        .checked_mul(rows)
+        .ok_or_else(|| Error::backend(Subsystem::Ffmpeg, "decoded chroma size overflow"))?;
+    let v_len = v_stride
+        .checked_mul(rows)
+        .ok_or_else(|| Error::backend(Subsystem::Ffmpeg, "decoded chroma size overflow"))?;
+    if u_plane.len() < u_len || v_plane.len() < v_len {
+        return Err(Error::backend(
+            Subsystem::Ffmpeg,
+            "decoded chroma plane is shorter than its stride",
+        ));
+    }
+    let row_bytes = chroma_width
+        .checked_mul(2)
+        .ok_or_else(|| Error::backend(Subsystem::Ffmpeg, "NV12 chroma size overflow"))?;
+    let dst_len = row_bytes
+        .checked_mul(rows)
+        .ok_or_else(|| Error::backend(Subsystem::Ffmpeg, "NV12 chroma size overflow"))?;
+    let mut data = vec![0u8; dst_len];
+    for row in 0..rows {
+        let u = &u_plane[row * u_stride..row * u_stride + chroma_width];
+        let v = &v_plane[row * v_stride..row * v_stride + chroma_width];
+        let dst = &mut data[row * row_bytes..row * row_bytes + row_bytes];
+        let mut column = 0;
+        while column + 8 <= chroma_width {
+            dst[column * 2] = u[column];
+            dst[column * 2 + 1] = v[column];
+            dst[column * 2 + 2] = u[column + 1];
+            dst[column * 2 + 3] = v[column + 1];
+            dst[column * 2 + 4] = u[column + 2];
+            dst[column * 2 + 5] = v[column + 2];
+            dst[column * 2 + 6] = u[column + 3];
+            dst[column * 2 + 7] = v[column + 3];
+            dst[column * 2 + 8] = u[column + 4];
+            dst[column * 2 + 9] = v[column + 4];
+            dst[column * 2 + 10] = u[column + 5];
+            dst[column * 2 + 11] = v[column + 5];
+            dst[column * 2 + 12] = u[column + 6];
+            dst[column * 2 + 13] = v[column + 6];
+            dst[column * 2 + 14] = u[column + 7];
+            dst[column * 2 + 15] = v[column + 7];
+            column += 8;
+        }
+        while column < chroma_width {
+            dst[column * 2] = u[column];
+            dst[column * 2 + 1] = v[column];
+            column += 1;
+        }
+    }
+    Ok(FramePlane {
+        data: Arc::from(data),
+        stride: row_bytes,
+        rows,
+    })
+}
+
+fn map_hardware_frame_to_dmabuf(
+    decoded: &frame::Video,
+    fallback_timestamp_us: u64,
+    metadata: StreamFormat,
+    mode: FfmpegMode,
+) -> Result<DecodedVideoFrame> {
+    let mut mapped = frame::Video::empty();
+    mapped.set_format(Pixel::DRM_PRIME);
+    let map_result = unsafe {
+        ffi::av_hwframe_map(
+            mapped.as_mut_ptr(),
+            decoded.as_ptr(),
+            ffi::AV_HWFRAME_MAP_READ as i32 | ffi::AV_HWFRAME_MAP_DIRECT as i32,
+        )
+    };
+    if map_result < 0 {
+        return Err(ffmpeg_error(
+            format!("{} frame DMA-BUF export failed", mode.label()),
+            map_result,
+        ));
+    }
+    let output_format = StreamFormat {
+        width: decoded.width().max(1),
+        height: decoded.height().max(1),
+        pixel_format: decoded_hardware_pixel_format(decoded)?,
+        ..metadata
+    };
+    let timestamp_us = decoded
+        .pts()
+        .and_then(|timestamp| u64::try_from(timestamp).ok())
+        .unwrap_or(fallback_timestamp_us);
+    drm_frame(mapped, timestamp_us, output_format)
+}
+
+fn validate_request_profile(format: StreamFormat) -> Result<()> {
+    if format.pixel_format != PixelFormat::Nv12 || format.color_transfer != ColorTransfer::Sdr {
+        return Err(Error::unavailable(
+            Subsystem::V4l2,
+            "V4L2 request decoding supports only 8-bit 4:2:0 SDR",
+        ));
+    }
+    Ok(())
+}
+
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+fn is_presentable_request_modifier(modifier: u64) -> bool {
+    modifier == DRM_FORMAT_MOD_LINEAR || modifier & 0xff00_0000_0000_00ff == 0x0700_0000_0000_0004
+}
+
+fn retain_request_frame(
+    decoded: &frame::Video,
+    fallback_timestamp_us: u64,
+    metadata: StreamFormat,
+) -> Result<DecodedVideoFrame> {
+    reject_corrupt_frame(decoded, Subsystem::V4l2)?;
+    if decoded.format() != Pixel::DRM_PRIME {
+        return Err(Error::backend(
+            Subsystem::V4l2,
+            "request decoder returned a non-DRM frame; CPU fallback is disabled",
+        ));
+    }
+    unsafe {
+        let raw = &*decoded.as_ptr();
+        if raw.crop_left != 0 || raw.crop_top != 0 {
+            return Err(Error::unavailable(
+                Subsystem::V4l2,
+                "request presentation does not support a nonzero crop origin",
+            ));
+        }
+    }
+    let metadata = decoded_metadata(decoded, metadata);
+    validate_request_profile(metadata)?;
+    let mut retained = frame::Video::empty();
+    let result = unsafe { ffi::av_frame_ref(retained.as_mut_ptr(), decoded.as_ptr()) };
+    if result < 0 {
+        return Err(ffmpeg_error("retain request frame".to_owned(), result));
+    }
+    let timestamp_us = decoded
+        .pts()
+        .and_then(|timestamp| u64::try_from(timestamp).ok())
+        .unwrap_or(fallback_timestamp_us);
+    let output = drm_frame(
+        retained,
+        timestamp_us,
+        StreamFormat {
+            width: decoded.width(),
+            height: decoded.height(),
+            pixel_format: PixelFormat::Nv12,
+            ..metadata
+        },
+    )?;
+    let dmabuf = output
+        .dmabuf
+        .as_ref()
+        .expect("DRM frame has DMA-BUF backing");
+    if dmabuf.layers.len() != 1
+        || dmabuf.layers[0].format != u32::from_le_bytes(*b"NV12")
+        || dmabuf.layers[0].planes.len() != 2
+        || dmabuf
+            .objects
+            .iter()
+            .any(|object| !is_presentable_request_modifier(object.format_modifier))
+    {
+        return Err(Error::unavailable(
+            Subsystem::V4l2,
+            "request output is not linear or SAND128 NV12; tiled and 10-bit layouts are unsupported",
+        ));
+    }
+    Ok(output)
+}
+
+fn drm_frame(
+    mapped: frame::Video,
+    timestamp_us: u64,
+    output_format: StreamFormat,
+) -> Result<DecodedVideoFrame> {
+    let descriptor = unsafe {
+        let data = (*mapped.as_ptr()).data[0];
+        if data.is_null() {
+            return Err(Error::backend(
+                Subsystem::Ffmpeg,
+                "DMA-BUF mapping returned no DRM descriptor",
+            ));
+        }
+        &*data.cast::<ffi::AVDRMFrameDescriptor>()
+    };
+    let object_count = usize::try_from(descriptor.nb_objects).unwrap_or(usize::MAX);
+    let layer_count = usize::try_from(descriptor.nb_layers).unwrap_or(usize::MAX);
+    if object_count == 0
+        || object_count > descriptor.objects.len()
+        || layer_count == 0
+        || layer_count > descriptor.layers.len()
+    {
+        return Err(Error::backend(
+            Subsystem::Ffmpeg,
+            "DMA-BUF mapping returned invalid object/layer counts",
+        ));
+    }
+    let objects = descriptor.objects[..object_count]
+        .iter()
+        .map(|object| DmaBufObject {
+            fd: object.fd,
+            size: object.size,
+            format_modifier: object.format_modifier,
+        })
+        .collect();
+    let mut layers = Vec::with_capacity(layer_count);
+    for layer in &descriptor.layers[..layer_count] {
+        let plane_count = usize::try_from(layer.nb_planes).unwrap_or(usize::MAX);
+        if plane_count == 0 || plane_count > layer.planes.len() {
+            return Err(Error::backend(
+                Subsystem::Ffmpeg,
+                "DMA-BUF mapping returned an invalid plane count",
+            ));
+        }
+        let planes = layer.planes[..plane_count]
+            .iter()
+            .map(|plane| {
+                Ok(DmaBufPlane {
+                    object_index: usize::try_from(plane.object_index).map_err(|_| {
+                        Error::backend(Subsystem::Ffmpeg, "negative DMA-BUF object index")
+                    })?,
+                    offset: usize::try_from(plane.offset).map_err(|_| {
+                        Error::backend(Subsystem::Ffmpeg, "negative DMA-BUF plane offset")
+                    })?,
+                    pitch: usize::try_from(plane.pitch).map_err(|_| {
+                        Error::backend(Subsystem::Ffmpeg, "negative DMA-BUF plane pitch")
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        layers.push(DmaBufLayer {
+            format: layer.format,
+            planes,
+        });
+    }
+    let dmabuf = Arc::new(DmaBufFrame::new(objects, layers, Arc::new(mapped)));
+    let frame = DecodedVideoFrame {
+        format: output_format,
+        planes: Vec::new(),
+        dmabuf: Some(dmabuf),
+        vulkan: None,
+        timestamp_us,
+    };
+    frame.validate()?;
+    Ok(frame)
+}
+
+impl VideoDecoder for FfmpegDecoder {
+    fn decode(&mut self, frame: &EncodedVideoFrame) -> Result<Vec<DecodedVideoFrame>> {
+        self.last_timestamp_us = frame.timestamp_us;
+        let mut packet = ffmpeg::Packet::copy(&frame.data);
+        packet.set_pts(i64::try_from(frame.timestamp_us).ok());
+        packet.set_dts(i64::try_from(frame.timestamp_us).ok());
+        if frame.keyframe {
+            packet.set_flags(ffmpeg::packet::Flags::KEY);
+        }
+        self.decoder
+            .send_packet(&packet)
+            .map_err(|error| self.decode_error("packet submission", error))?;
+        self.drain(false)
+    }
+
+    fn flush(&mut self) -> Result<Vec<DecodedVideoFrame>> {
+        match self.decoder.send_eof() {
+            Ok(()) | Err(ffmpeg::Error::Eof) => self.drain(true),
+            Err(error) => Err(Error::backend(
+                Subsystem::Ffmpeg,
+                format!("{} decoder flush failed: {error}", self.mode.label()),
+            )),
+        }
+    }
+
+    fn take_format_change(&mut self) -> Option<StreamFormat> {
+        self.pending_format_change.take()
+    }
+}
+
+fn initialize_ffmpeg() -> Result<()> {
+    static INITIALIZED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    INITIALIZED
+        .get_or_init(|| {
+            ffmpeg::init().map_err(|error| error.to_string())?;
+            unsafe { ffi::av_log_set_callback(Some(record_ffmpeg_log)) };
+            Ok(())
+        })
+        .clone()
+        .map_err(|reason| Error::unavailable(Subsystem::Ffmpeg, reason))
+}
+
+const FFMPEG_LOG_LINES: usize = 8;
+
+thread_local! {
+    static FFMPEG_LOG: RefCell<VecDeque<String>> = const { RefCell::new(VecDeque::new()) };
+}
+
+#[cfg(target_arch = "x86_64")]
+type FfmpegVaList = *mut ffi::__va_list_tag;
+#[cfg(not(target_arch = "x86_64"))]
+type FfmpegVaList = ffi::va_list;
+
+unsafe extern "C" fn record_ffmpeg_log(
+    context: *mut c_void,
+    level: c_int,
+    format: *const c_char,
+    arguments: FfmpegVaList,
+) {
+    if level > ffi::AV_LOG_VERBOSE {
+        return;
+    }
+    let mut line = [0 as c_char; 512];
+    let mut print_prefix = 1;
+    let written = unsafe {
+        ffi::av_log_format_line2(
+            context,
+            level,
+            format,
+            arguments,
+            line.as_mut_ptr(),
+            line.len() as c_int,
+            &mut print_prefix,
+        )
+    };
+    if written < 0 {
+        return;
+    }
+    let text = unsafe { CStr::from_ptr(line.as_ptr()) }.to_string_lossy();
+    let text = text.trim_end();
+    if text.is_empty() {
+        return;
+    }
+    if level <= unsafe { ffi::av_log_get_level() } {
+        eprintln!("{text}");
+    }
+    FFMPEG_LOG.with_borrow_mut(|lines| {
+        if lines.len() == FFMPEG_LOG_LINES {
+            lines.pop_front();
+        }
+        lines.push_back(text.to_owned());
+    });
+}
+
+fn take_ffmpeg_log() -> Vec<String> {
+    FFMPEG_LOG.with_borrow_mut(|lines| lines.drain(..).collect())
+}
+
+fn with_ffmpeg_log(reason: String) -> String {
+    let log = take_ffmpeg_log();
+    if log.is_empty() {
+        reason
+    } else {
+        format!("{reason} (FFmpeg: {})", log.join(" | "))
+    }
+}
+
+fn codec_id(codec: VideoCodec) -> codec::Id {
+    match codec {
+        VideoCodec::H264 => codec::Id::H264,
+        VideoCodec::H265 => codec::Id::HEVC,
+        VideoCodec::Av1 => codec::Id::AV1,
+    }
+}
+
+fn native_decoder_name(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => "h264",
+        VideoCodec::H265 => "hevc",
+        VideoCodec::Av1 => "av1",
+    }
+}
+
+fn hardware_pixel_format(
+    codec: ffmpeg::Codec,
+    device_type: ffi::AVHWDeviceType,
+) -> Option<ffi::AVPixelFormat> {
+    let mut index = 0;
+    loop {
+        let config = unsafe { ffi::avcodec_get_hw_config(codec.as_ptr(), index) };
+        if config.is_null() {
+            return None;
+        }
+        let matches = unsafe {
+            (*config).device_type == device_type
+                && ((*config).methods as u32 & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as u32)
+                    != 0
+        };
+        if matches {
+            return Some(unsafe { (*config).pix_fmt });
+        }
+        index += 1;
+    }
+}
+
+unsafe extern "C" fn select_hardware_format(
+    context: *mut ffi::AVCodecContext,
+    formats: *const ffi::AVPixelFormat,
+) -> ffi::AVPixelFormat {
+    if context.is_null() || formats.is_null() || unsafe { (*context).opaque.is_null() } {
+        return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+    }
+    let selection = unsafe { &*((*context).opaque as *const HardwareFormatSelection) };
+    let wanted = selection.pixel_format;
+    let mut current = formats;
+    while unsafe { *current } != ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+        if unsafe { *current } == wanted {
+            if selection.exportable_vulkan_frames
+                && !unsafe { configure_exportable_vulkan_frames(context, wanted) }
+            {
+                return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+            }
+            return wanted;
+        }
+        current = unsafe { current.add(1) };
+    }
+    ffi::AVPixelFormat::AV_PIX_FMT_NONE
+}
+
+/// Replaces libavcodec's implicit optimal-tiled Vulkan pool with a
+/// DRM-modifier pool. This has to happen inside `get_format`; FFmpeg resets
+/// `hw_frames_ctx` immediately before invoking the callback.
+unsafe fn configure_exportable_vulkan_frames(
+    context: *mut ffi::AVCodecContext,
+    pixel_format: ffi::AVPixelFormat,
+) -> bool {
+    let device = unsafe { (*context).hw_device_ctx };
+    if device.is_null() {
+        return false;
+    }
+    let mut frames = ptr::null_mut();
+    let result = unsafe {
+        ffi::avcodec_get_hw_frames_parameters(context, device, pixel_format, &mut frames)
+    };
+    if result < 0 || frames.is_null() {
+        return false;
+    }
+    let configured = (|| {
+        let frames_context = unsafe { (*frames).data.cast::<ffi::AVHWFramesContext>() };
+        if frames_context.is_null() {
+            return false;
+        }
+        let vulkan = unsafe { (*frames_context).hwctx.cast::<ffi::AVVulkanFramesContext>() };
+        if vulkan.is_null() {
+            return false;
+        }
+        // VkImageTiling is an i32 in the generated Vulkan ABI bindings.
+        // VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT = 1000158000.
+        unsafe {
+            (*vulkan).tiling = 1_000_158_000;
+            // NVIDIA exposes exportable modifiers for the component formats
+            // used by NV12, while its video decode profile rejects an
+            // exportable multi-planar image. Two images still remain entirely
+            // GPU-owned and are described as two DRM PRIME layers.
+            (*vulkan).flags = ffi::AVVkFrameFlags::AV_VK_FRAME_FLAG_DISABLE_MULTIPLANE;
+        }
+        if unsafe { ffi::av_hwframe_ctx_init(frames) } < 0 {
+            return false;
+        }
+        let retained = unsafe { ffi::av_buffer_ref(frames) };
+        if retained.is_null() {
+            return false;
+        }
+        unsafe {
+            ffi::av_buffer_unref(&mut (*context).hw_frames_ctx);
+            (*context).hw_frames_ctx = retained;
+        }
+        true
+    })();
+    unsafe { ffi::av_buffer_unref(&mut frames) };
+    configured
+}
+
+fn ffmpeg_error(operation: String, code: i32) -> Error {
+    Error::backend(
+        Subsystem::Ffmpeg,
+        format!("{operation}: {}", ffmpeg::Error::from(code)),
+    )
+}
+
+fn decoded_hardware_software_format(frame: &frame::Video) -> Result<Pixel> {
+    unsafe {
+        let frames = (*frame.as_ptr()).hw_frames_ctx;
+        if frames.is_null() || (*frames).data.is_null() {
+            return Err(Error::backend(
+                Subsystem::Ffmpeg,
+                "hardware frame has no software format metadata",
+            ));
+        }
+        Ok(Pixel::from(
+            (*(*frames).data.cast::<ffi::AVHWFramesContext>()).sw_format,
+        ))
+    }
+}
+
+fn decoded_hardware_pixel_format(frame: &frame::Video) -> Result<PixelFormat> {
+    let pixel = decoded_hardware_software_format(frame)?;
+    match ffi::AVPixelFormat::from(pixel) {
+        ffi::AVPixelFormat::AV_PIX_FMT_NV12 => Ok(PixelFormat::Nv12),
+        ffi::AVPixelFormat::AV_PIX_FMT_P010LE => Ok(PixelFormat::P010),
+        ffi::AVPixelFormat::AV_PIX_FMT_NV24 => Ok(PixelFormat::Nv24),
+        ffi::AVPixelFormat::AV_PIX_FMT_P410LE => Ok(PixelFormat::P410),
+        _ => Err(Error::unavailable(
+            Subsystem::Ffmpeg,
+            format!("unsupported zero-copy hardware pixel format {pixel:?}"),
+        )),
+    }
+}
+
+fn cpu_conversion_allowed(metadata: StreamFormat, pixel: Pixel) -> bool {
+    if metadata.color_transfer != ColorTransfer::Sdr
+        || metadata.pixel_format.is_ten_bit()
+        || metadata.pixel_format.is_444()
+    {
+        return false;
+    }
+    let descriptor = unsafe { ffi::av_pix_fmt_desc_get(pixel.into()) };
+    !descriptor.is_null()
+        && unsafe {
+            (*descriptor).nb_components != 0
+                && !((*descriptor).nb_components >= 3
+                    && (*descriptor).log2_chroma_w == 0
+                    && (*descriptor).log2_chroma_h == 0
+                    && (*descriptor).flags & ffi::AV_PIX_FMT_FLAG_RGB as u64 == 0)
+                && (*descriptor)
+                    .comp
+                    .iter()
+                    .all(|component| component.depth <= 8)
+        }
+}
+
+fn vaapi_cpu_transfer_allowed(mode: FfmpegMode, metadata: StreamFormat, pixel: Pixel) -> bool {
+    mode == FfmpegMode::Vaapi && cpu_conversion_allowed(metadata, pixel)
+}
+
+/// Mirrors GFN's VideoToolbox path, which classifies an unrecognized matrix as unknown and
+/// renders it with the default table instead of failing decode: metadata this presenter cannot
+/// represent falls back to the negotiated value and is reported once per field.
+fn decoded_metadata(frame: &frame::Video, defaults: StreamFormat) -> StreamFormat {
+    use ffmpeg::color::{Primaries, Range, Space, TransferCharacteristic as Transfer};
+    let color_range = match frame.color_range() {
+        Range::Unspecified => defaults.color_range,
+        Range::JPEG => ColorRange::Full,
+        Range::MPEG => ColorRange::Limited,
+    };
+    let color_matrix = match frame.color_space() {
+        Space::Unspecified => defaults.color_matrix,
+        Space::BT709 => ColorMatrix::Bt709,
+        Space::BT470BG | Space::SMPTE170M => ColorMatrix::Bt601,
+        Space::BT2020NCL => ColorMatrix::Bt2020,
+        other => unsupported_color_metadata(0, "matrix", other, defaults.color_matrix),
+    };
+    let color_transfer = match frame.color_transfer_characteristic() {
+        Transfer::Unspecified => defaults.color_transfer,
+        Transfer::SMPTE2084 => ColorTransfer::Pq,
+        Transfer::ARIB_STD_B67 => ColorTransfer::Hlg,
+        Transfer::BT709
+        | Transfer::SMPTE170M
+        | Transfer::IEC61966_2_1
+        | Transfer::BT2020_10
+        | Transfer::BT2020_12 => ColorTransfer::Sdr,
+        other => unsupported_color_metadata(1, "transfer", other, defaults.color_transfer),
+    };
+    let color_primaries = match frame.color_primaries() {
+        Primaries::Unspecified => defaults.color_primaries,
+        Primaries::BT709 => ColorPrimaries::Bt709,
+        Primaries::BT2020 => ColorPrimaries::Bt2020,
+        other => unsupported_color_metadata(2, "primaries", other, defaults.color_primaries),
+    };
+    let chroma_location = match frame.chroma_location() {
+        ffmpeg::chroma::Location::Unspecified => defaults.chroma_location,
+        ffmpeg::chroma::Location::Center => ChromaLocation::Center,
+        ffmpeg::chroma::Location::Left => ChromaLocation::Left,
+        ffmpeg::chroma::Location::TopLeft => ChromaLocation::TopLeft,
+        other => unsupported_color_metadata(3, "chroma location", other, defaults.chroma_location),
+    };
+    StreamFormat {
+        color_range,
+        color_matrix,
+        color_transfer,
+        color_primaries,
+        chroma_location,
+        ..defaults
+    }
+}
+
+fn unsupported_color_metadata<T: std::fmt::Debug>(
+    field_bit: u32,
+    field: &str,
+    value: impl std::fmt::Debug,
+    fallback: T,
+) -> T {
+    static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let bit = 1 << field_bit;
+    if REPORTED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
+        eprintln!(
+            "decoded color {field} {value:?} is not presentable; using negotiated {fallback:?}"
+        );
+    }
+    fallback
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+    use std::process::Command;
+
+    use super::*;
+
+    fn software_decoder(codec: VideoCodec, format: StreamFormat) -> Option<FfmpegDecoder> {
+        let opened = FfmpegDecoder::open(codec, format, FfmpegMode::Software);
+        if cfg!(feature = "hardware-only") {
+            let error = opened
+                .err()
+                .expect("hardware-only must reject direct software decoder creation");
+            assert!(error.to_string().contains("hardware-only"), "{error}");
+            return None;
+        }
+        Some(opened.unwrap())
+    }
+
+    fn decoder_for_synthetic_frames(format: StreamFormat) -> FfmpegDecoder {
+        initialize_ffmpeg().unwrap();
+        let definition = ffmpeg::decoder::find(codec::Id::H264).unwrap();
+        let decoder = codec::context::Context::new_with_codec(definition)
+            .decoder()
+            .open_as(definition)
+            .unwrap()
+            .video()
+            .unwrap();
+        FfmpegDecoder {
+            decoder,
+            wanted_hw_format: None,
+            scaler: None,
+            codec: VideoCodec::H264,
+            mode: FfmpegMode::Software,
+            configured_format: format,
+            negotiated_format: format,
+            pending_format_change: None,
+            last_timestamp_us: 0,
+            zero_copy_active: false,
+            zero_copy_unavailable_reported: false,
+            #[cfg(feature = "vulkan")]
+            shared_device: None,
+            #[cfg(feature = "vulkan")]
+            snapshot_pool: None,
+        }
+    }
+
+    #[test]
+    fn hardware_only_policy_rejects_every_software_codec_and_probe() {
+        for codec in [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1] {
+            let format = StreamFormat::video_default(64, 64).unwrap();
+            let probe = super::super::probe_ffmpeg_software(codec);
+            if cfg!(feature = "hardware-only") {
+                assert!(software_decoder(codec, format).is_none());
+                assert!(probe.unwrap_err().contains("hardware-only"));
+            } else if codec != VideoCodec::Av1 {
+                assert!(software_decoder(codec, format).is_some());
+                assert!(probe.is_ok());
+            }
+        }
+    }
+
+    unsafe extern "C" fn reject_probe_format(
+        _context: *mut ffi::AVCodecContext,
+        _formats: *const ffi::AVPixelFormat,
+    ) -> ffi::AVPixelFormat {
+        ffi::AVPixelFormat::AV_PIX_FMT_NONE
+    }
+
+    #[test]
+    fn opening_a_decoder_does_not_validate_first_packet_support() {
+        let format = StreamFormat::video_default(1920, 1080).unwrap();
+        let Some(mut decoder) = software_decoder(VideoCodec::H264, format) else {
+            return;
+        };
+        unsafe { (*decoder.decoder.as_mut_ptr()).get_format = Some(reject_probe_format) };
+        let packet = ffmpeg::Packet::copy(include_bytes!("fixtures/cuda_probe.h264"));
+        assert!(decoder.decoder.send_packet(&packet).is_err());
+    }
+
+    #[test]
+    fn decode_probe_rejects_first_packet_format_failure() {
+        let format = StreamFormat::video_default(1920, 1080).unwrap();
+        let Some(mut decoder) = software_decoder(VideoCodec::H264, format) else {
+            return;
+        };
+        unsafe { (*decoder.decoder.as_mut_ptr()).get_format = Some(reject_probe_format) };
+        let error = decoder.probe_frame().unwrap_err().to_string();
+        assert!(error.contains("probe packet submission failed"), "{error}");
+    }
+
+    #[test]
+    fn decode_probe_requires_a_frame_with_the_requested_hardware_format() {
+        let format = StreamFormat::video_default(1920, 1080).unwrap();
+        let Some(mut decoder) = software_decoder(VideoCodec::H264, format) else {
+            return;
+        };
+        decoder.wanted_hw_format = Some(Box::new(HardwareFormatSelection {
+            pixel_format: ffi::AVPixelFormat::AV_PIX_FMT_CUDA,
+            exportable_vulkan_frames: false,
+        }));
+        let error = decoder.probe_frame().unwrap_err().to_string();
+        assert!(
+            error.contains("did not produce a hardware frame"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn decode_probe_fixtures_produce_a_full_hd_frame() {
+        let format = StreamFormat::video_default(1920, 1080).unwrap();
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            let Some(mut decoder) = software_decoder(codec, format) else {
+                continue;
+            };
+            decoder.probe_frame().unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in: requires CUDA/NVDEC hardware supporting at least one codec"]
+    fn cuda_probe_decodes_each_advertised_codec() {
+        let mut available = 0;
+        for codec in [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1] {
+            match FfmpegDecoder::probe(codec, FfmpegMode::Cuda) {
+                Ok(detail) => {
+                    available += 1;
+                    assert!(detail.contains("CUDA/NVDEC"), "{detail}");
+                }
+                Err(reason) => eprintln!("{} unavailable: {reason}", codec.label()),
+            }
+        }
+        assert!(available > 0, "no CUDA codec produced a hardware frame");
+    }
+
+    #[test]
+    #[ignore = "opt-in: requires CUDA/NVDEC hardware with H.264 support but no AV1 support"]
+    fn cuda_probe_rejects_av1_on_h264_only_hardware() {
+        FfmpegDecoder::probe(VideoCodec::H264, FfmpegMode::Cuda)
+            .expect("this test requires working H.264 CUDA decode");
+        let reason = FfmpegDecoder::probe(VideoCodec::Av1, FfmpegMode::Cuda)
+            .expect_err("AV1 must not be advertised on hardware without AV1 decode");
+        assert!(
+            reason.contains("probe packet submission failed"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("Hardware is lacking required capabilities"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn ffmpeg_log_lines_reach_decoder_errors_and_are_bounded() {
+        initialize_ffmpeg().unwrap();
+        take_ffmpeg_log();
+        unsafe {
+            ffi::av_log(
+                ptr::null_mut(),
+                ffi::AV_LOG_DEBUG,
+                c"ignored %s\n".as_ptr(),
+                c"debug".as_ptr(),
+            );
+            for index in 0..(FFMPEG_LOG_LINES as c_int + 2) {
+                ffi::av_log(
+                    ptr::null_mut(),
+                    ffi::AV_LOG_VERBOSE,
+                    c"capture probe %d failed\n".as_ptr(),
+                    index,
+                );
+            }
+        }
+        let reason = with_ffmpeg_log("open failed".to_owned());
+        assert!(reason.starts_with("open failed (FFmpeg: capture probe 2 failed | "));
+        assert!(reason.ends_with("capture probe 9 failed)"));
+        assert!(!reason.contains("ignored"));
+        assert_eq!(with_ffmpeg_log("open failed".to_owned()), "open failed");
+    }
+
+    #[test]
+    fn software_decode_thread_count_stays_within_the_latency_budget() {
+        let threads = software_decode_thread_count();
+        assert!((2..=4).contains(&threads));
+    }
+
+    #[cfg(feature = "ffmpeg-bundled")]
+    #[test]
+    fn bundled_vaapi_includes_dmabuf_export_support() {
+        let configuration = unsafe { std::ffi::CStr::from_ptr(ffi::avutil_configuration()) }
+            .to_str()
+            .unwrap();
+        assert!(
+            configuration
+                .split_whitespace()
+                .any(|option| option == "--enable-libdrm"),
+            "bundled VAAPI requires DRM PRIME export: {configuration}"
+        );
+    }
+
+    #[test]
+    fn software_decoder_opens_with_low_delay_and_a_bounded_thread_pool() {
+        let format = StreamFormat::video_default(64, 64).unwrap();
+        let Some(decoder) = software_decoder(VideoCodec::H264, format) else {
+            return;
+        };
+        unsafe {
+            let raw = decoder.decoder.as_ptr();
+            assert!(
+                (2..=4).contains(&(*raw).thread_count),
+                "thread_count {}",
+                (*raw).thread_count
+            );
+            assert_ne!((*raw).flags & ffi::AV_CODEC_FLAG_LOW_DELAY as i32, 0);
+            assert_eq!(
+                (*raw).thread_type & ffi::FF_THREAD_SLICE,
+                ffi::FF_THREAD_SLICE
+            );
+            assert_eq!((*raw).thread_type & ffi::FF_THREAD_FRAME, 0);
+        }
+    }
+
+    #[test]
+    fn software_decoder_refuses_a_corrupt_frame() {
+        let format = StreamFormat::video_default(2, 2).unwrap();
+        let Some(mut decoder) = software_decoder(VideoCodec::H264, format) else {
+            return;
+        };
+        let mut decoded = frame::Video::new(Pixel::NV12, 2, 2);
+        unsafe { (*decoded.as_mut_ptr()).flags |= ffi::AV_FRAME_FLAG_CORRUPT };
+        assert!(matches!(
+            decoder.convert_frame(&decoded),
+            Err(Error::ReferenceLost {
+                subsystem: Subsystem::Ffmpeg,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn every_decode_mode_rejects_corruption_before_hardware_inspection() {
+        let format = StreamFormat::video_default(2, 2).unwrap();
+        let mut decoder = decoder_for_synthetic_frames(format);
+        for (mode, pixel) in [
+            (FfmpegMode::Software, Pixel::NV12),
+            (FfmpegMode::Vulkan, Pixel::VULKAN),
+            (FfmpegMode::Vaapi, Pixel::VAAPI),
+            (FfmpegMode::Cuda, Pixel::CUDA),
+            (FfmpegMode::V4l2Request, Pixel::DRM_PRIME),
+        ] {
+            decoder.mode = mode;
+            decoder.wanted_hw_format = Some(Box::new(HardwareFormatSelection {
+                pixel_format: pixel.into(),
+                exportable_vulkan_frames: false,
+            }));
+            for (flags, decode_error_flags) in [(ffi::AV_FRAME_FLAG_CORRUPT, 0), (0, 1)] {
+                let mut decoded = frame::Video::empty();
+                decoded.set_format(pixel);
+                unsafe {
+                    (*decoded.as_mut_ptr()).flags = flags;
+                    (*decoded.as_mut_ptr()).decode_error_flags = decode_error_flags;
+                }
+                let expected_subsystem = if mode == FfmpegMode::V4l2Request {
+                    Subsystem::V4l2
+                } else {
+                    Subsystem::Ffmpeg
+                };
+                assert!(
+                    matches!(
+                        decoder.convert_frame(&decoded),
+                        Err(Error::ReferenceLost { subsystem, .. }) if subsystem == expected_subsystem
+                    ),
+                    "{mode:?}, flags={flags}, decode_error_flags={decode_error_flags}"
+                );
+                assert!(decoder.pending_format_change.is_none());
+                assert_eq!(decoder.configured_format, format);
+            }
+        }
+    }
+
+    #[test]
+    fn yuv420p_pack_interleaves_chroma_and_drops_stride_padding() {
+        let y = [1u8, 2, 3, 4, 9, 9, 5, 6, 7, 8, 9, 9];
+        let u = [20u8, 21, 0, 22, 23, 0];
+        let v = [30u8, 31, 0, 32, 33, 0];
+        let luma = pack_plane(&y, 6, 4, 2).unwrap();
+        let chroma = interleave_chroma(&u, 3, &v, 3, 2, 2).unwrap();
+        assert_eq!(luma.stride, 4);
+        assert_eq!(luma.data.as_ref(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(chroma.stride, 4);
+        assert_eq!(chroma.rows, 2);
+        assert_eq!(chroma.data.as_ref(), &[20, 30, 21, 31, 22, 32, 23, 33]);
+    }
+
+    #[test]
+    fn contiguous_nv12_plane_is_a_single_copy() {
+        let packed = pack_plane(&[1, 2, 3, 4, 5, 6], 3, 3, 2).unwrap();
+        assert_eq!(packed.stride, 3);
+        assert_eq!(packed.data.as_ref(), &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn vaapi_device_policy_only_requires_a_profile_where_one_was_negotiated() {
+        use super::super::vaapi_probe::VaapiDepth;
+
+        for codec in [VideoCodec::H265, VideoCodec::Av1] {
+            assert_eq!(
+                vaapi_device_policy(codec, FfmpegMode::Vaapi, PixelFormat::Nv12),
+                VaapiDevicePolicy::Require(VaapiDepth::EightBit420)
+            );
+            assert_eq!(
+                vaapi_device_policy(codec, FfmpegMode::Vaapi, PixelFormat::P010),
+                VaapiDevicePolicy::Require(VaapiDepth::TenBit420)
+            );
+        }
+        assert_eq!(
+            vaapi_device_policy(VideoCodec::H264, FfmpegMode::Vaapi, PixelFormat::P010),
+            VaapiDevicePolicy::Require(VaapiDepth::TenBit420)
+        );
+        assert_eq!(
+            vaapi_device_policy(VideoCodec::H264, FfmpegMode::Vaapi, PixelFormat::Nv12),
+            VaapiDevicePolicy::Default
+        );
+        assert_eq!(
+            vaapi_device_policy(VideoCodec::H265, FfmpegMode::Vulkan, PixelFormat::P010),
+            VaapiDevicePolicy::Default
+        );
+        assert_eq!(
+            vaapi_device_policy(VideoCodec::H265, FfmpegMode::Software, PixelFormat::Nv12),
+            VaapiDevicePolicy::Default
+        );
+        for pixel_format in [PixelFormat::Nv24, PixelFormat::P410, PixelFormat::I420] {
+            assert_eq!(
+                vaapi_device_policy(VideoCodec::H265, FfmpegMode::Vaapi, pixel_format),
+                VaapiDevicePolicy::Default
+            );
+        }
+    }
+
+    #[test]
+    fn vaapi_8_bit_selection_never_reuses_the_10_bit_profile_query() {
+        use super::super::vaapi_probe::{VaapiDepth, color_queries};
+
+        let eight = VaapiDepth::EightBit420.query(VideoCodec::H265).unwrap();
+        let ten = VaapiDepth::TenBit420.query(VideoCodec::H265).unwrap();
+        assert_ne!(eight, ten);
+        assert_eq!(color_queries(VideoCodec::H265), Some([eight, ten]));
+        assert_ne!(
+            VaapiDepth::EightBit420.query(VideoCodec::Av1).unwrap(),
+            VaapiDepth::TenBit420.query(VideoCodec::Av1).unwrap()
+        );
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "ffmpeg-bundled"))]
+    #[test]
+    fn bundled_arm64_exposes_request_hwaccels_for_every_codec() {
+        initialize_ffmpeg().unwrap();
+        let device_type =
+            request_device_type().expect("bundled ARM64 FFmpeg must know v4l2request");
+        for codec in [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1] {
+            let decoder = ffmpeg::decoder::find_by_name(native_decoder_name(codec))
+                .expect("native decoder must be bundled");
+            assert_eq!(
+                hardware_pixel_format(decoder, device_type),
+                Some(ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME),
+                "bundled ARM64 {} requires a DRM_PRIME request hwaccel",
+                codec.label(),
+            );
+        }
+    }
+
+    fn request_frame_fixture() -> (frame::Video, File) {
+        let file = File::open("/dev/zero").unwrap();
+        let mut frame = frame::Video::empty();
+        frame.set_format(Pixel::DRM_PRIME);
+        frame.set_width(256);
+        frame.set_height(144);
+        frame.set_pts(Some(123_456));
+        unsafe {
+            let raw = &mut *frame.as_mut_ptr();
+            raw.buf[0] = ffi::av_buffer_alloc(std::mem::size_of::<ffi::AVDRMFrameDescriptor>());
+            assert!(!raw.buf[0].is_null());
+            raw.data[0] = (*raw.buf[0]).data;
+            let descriptor = &mut *raw.data[0].cast::<ffi::AVDRMFrameDescriptor>();
+            *descriptor = std::mem::zeroed();
+            descriptor.nb_objects = 1;
+            descriptor.objects[0].fd = file.as_raw_fd();
+            descriptor.objects[0].size = 256 * 256;
+            descriptor.objects[0].format_modifier = 0x0700_0000_0000_0004 | (256 << 8);
+            descriptor.nb_layers = 1;
+            descriptor.layers[0].format = u32::from_le_bytes(*b"NV12");
+            descriptor.layers[0].nb_planes = 2;
+            descriptor.layers[0].planes[0].pitch = 256;
+            descriptor.layers[0].planes[1].pitch = 256;
+            descriptor.layers[0].planes[1].offset = 144 * 128;
+            raw.hw_frames_ctx = ffi::av_buffer_alloc(std::mem::size_of::<ffi::AVHWFramesContext>());
+            assert!(!raw.hw_frames_ctx.is_null());
+            let hwframes = &mut *(*raw.hw_frames_ctx).data.cast::<ffi::AVHWFramesContext>();
+            *hwframes = std::mem::zeroed();
+            hwframes.sw_format = ffi::AVPixelFormat::AV_PIX_FMT_NB;
+        }
+        (frame, file)
+    }
+
+    #[test]
+    fn request_frame_retains_drm_backing_without_software_pixel_conversion() {
+        let (decoded, _file) = request_frame_fixture();
+        let metadata = StreamFormat::video_default(256, 144).unwrap();
+        let output = retain_request_frame(&decoded, 999, metadata).unwrap();
+        assert_eq!(output.timestamp_us, 123_456);
+        assert_eq!(output.format, metadata);
+        assert!(output.planes.is_empty());
+        assert!(output.vulkan.is_none());
+        assert_eq!(output.dmabuf.as_ref().unwrap().objects.len(), 1);
+        unsafe {
+            assert_eq!(ffi::av_buffer_get_ref_count((*decoded.as_ptr()).buf[0]), 2);
+        }
+        drop(output);
+        unsafe {
+            assert_eq!(ffi::av_buffer_get_ref_count((*decoded.as_ptr()).buf[0]), 1);
+        }
+    }
+
+    #[test]
+    fn request_frames_retain_explicit_chroma_metadata_with_drm_backing() {
+        let (mut decoded, _file) = request_frame_fixture();
+        let defaults = StreamFormat::video_default(256, 144).unwrap();
+        for (source, expected) in [
+            (ffmpeg::chroma::Location::Left, ChromaLocation::Left),
+            (ffmpeg::chroma::Location::Center, ChromaLocation::Center),
+            (ffmpeg::chroma::Location::TopLeft, ChromaLocation::TopLeft),
+        ] {
+            unsafe { (*decoded.as_mut_ptr()).chroma_location = source.into() };
+            let output = retain_request_frame(&decoded, 0, defaults).unwrap();
+            assert_eq!(output.format.chroma_location, expected);
+            assert!(output.dmabuf.is_some());
+            assert!(output.planes.is_empty());
+        }
+    }
+
+    #[test]
+    fn request_frame_retains_linear_nv12_from_stateless_decoders() {
+        let (mut decoded, _file) = request_frame_fixture();
+        unsafe {
+            let descriptor =
+                &mut *(*decoded.as_mut_ptr()).data[0].cast::<ffi::AVDRMFrameDescriptor>();
+            descriptor.objects[0].format_modifier = 0;
+            descriptor.layers[0].planes[1].offset = 256 * 144;
+        }
+        let metadata = StreamFormat::video_default(256, 144).unwrap();
+        let output = retain_request_frame(&decoded, 0, metadata).unwrap();
+        let dmabuf = output.dmabuf.as_ref().unwrap();
+        assert_eq!(dmabuf.objects[0].format_modifier, 0);
+        assert_eq!(dmabuf.layers[0].planes[1].offset, 256 * 144);
+    }
+
+    #[test]
+    fn request_frame_rejects_corruption_p030_tiled_and_cropped_origins() {
+        let metadata = StreamFormat::video_default(256, 144).unwrap();
+        let (mut decoded, _file) = request_frame_fixture();
+        unsafe { (*decoded.as_mut_ptr()).flags |= ffi::AV_FRAME_FLAG_CORRUPT };
+        assert!(matches!(
+            retain_request_frame(&decoded, 0, metadata),
+            Err(Error::ReferenceLost {
+                subsystem: Subsystem::V4l2,
+                ..
+            })
+        ));
+        unsafe {
+            (*decoded.as_mut_ptr()).flags = 0;
+            (*decoded.as_mut_ptr()).crop_left = 2;
+        }
+        assert!(retain_request_frame(&decoded, 0, metadata).is_err());
+        unsafe {
+            (*decoded.as_mut_ptr()).crop_left = 0;
+            let descriptor =
+                &mut *(*decoded.as_mut_ptr()).data[0].cast::<ffi::AVDRMFrameDescriptor>();
+            descriptor.layers[0].format = u32::from_le_bytes(*b"P030");
+        }
+        assert!(retain_request_frame(&decoded, 0, metadata).is_err());
+        unsafe {
+            let descriptor =
+                &mut *(*decoded.as_mut_ptr()).data[0].cast::<ffi::AVDRMFrameDescriptor>();
+            descriptor.layers[0].format = u32::from_le_bytes(*b"NV12");
+            descriptor.objects[0].format_modifier = 0x0900_0000_0000_0001;
+        }
+        assert!(retain_request_frame(&decoded, 0, metadata).is_err());
+        decoded.set_format(Pixel::NV12);
+        assert!(retain_request_frame(&decoded, 0, metadata).is_err());
+    }
+
+    #[test]
+    fn ffmpeg_applies_request_frame_padding_before_retention() {
+        let context = codec::Context::new();
+        assert_eq!(unsafe { (*context.as_ptr()).apply_cropping }, 1);
+        let (mut decoded, _file) = request_frame_fixture();
+        decoded.set_width(1920);
+        decoded.set_height(1088);
+        unsafe {
+            let raw = &mut *decoded.as_mut_ptr();
+            raw.crop_bottom = 8;
+            let descriptor = &mut *raw.data[0].cast::<ffi::AVDRMFrameDescriptor>();
+            descriptor.objects[0].size = 15 * 128 * 1632;
+            descriptor.objects[0].format_modifier = 0x0700_0000_0000_0004 | (1632 << 8);
+            descriptor.layers[0].planes[0].pitch = 1920;
+            descriptor.layers[0].planes[1].pitch = 1920;
+            descriptor.layers[0].planes[1].offset = 1088 * 128;
+            assert_eq!(ffi::av_frame_apply_cropping(decoded.as_mut_ptr(), 0), 0);
+            assert_eq!((*decoded.as_ptr()).crop_bottom, 0);
+        }
+        let output = retain_request_frame(
+            &decoded,
+            0,
+            StreamFormat::video_default(1920, 1080).unwrap(),
+        )
+        .unwrap();
+        assert_eq!((output.format.width, output.format.height), (1920, 1080));
+        assert_eq!(
+            output.dmabuf.as_ref().unwrap().layers[0].planes[1].offset,
+            1088 * 128,
+        );
+    }
+
+    #[test]
+    fn request_decode_rejects_ten_bit_and_hdr_before_device_probe() {
+        let mut format = StreamFormat::video_default(256, 144).unwrap();
+        assert!(validate_request_profile(format).is_ok());
+        for codec in [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1] {
+            format.pixel_format = PixelFormat::P010;
+            format.color_transfer = ColorTransfer::Sdr;
+            let error = FfmpegDecoder::open(codec, format, FfmpegMode::V4l2Request)
+                .err()
+                .expect("10-bit request decode must be rejected");
+            assert!(error.to_string().contains("8-bit 4:2:0 SDR"), "{error}");
+            format.pixel_format = PixelFormat::Nv12;
+            format.color_transfer = ColorTransfer::Pq;
+            assert!(validate_request_profile(format).is_err());
+            assert!(FfmpegDecoder::open(codec, format, FfmpegMode::V4l2Request).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in: requires V4L2 request decode hardware, bundled FFmpeg, and FFmpeg CLI with libx264/libx265"]
+    fn v4l2_request_decode_is_drm_only() {
+        let codecs = [(VideoCodec::H264, "libx264"), (VideoCodec::H265, "libx265")]
+            .into_iter()
+            .filter(|(codec, _)| super::super::v4l2_request::probe(*codec, 640, 360).is_ok())
+            .collect::<Vec<_>>();
+        assert!(
+            !codecs.is_empty(),
+            "no H.264 or HEVC request decoder is present"
+        );
+        for ((codec, encoder), (width, height)) in codecs
+            .into_iter()
+            .flat_map(|codec| [(codec, (256, 144)), (codec, (640, 360))])
+        {
+            let encoded = Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("color=c=blue:size={width}x{height}:rate=60"),
+                    "-frames:v",
+                    "1",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:v",
+                    encoder,
+                    "-f",
+                    if codec == VideoCodec::H264 {
+                        "h264"
+                    } else {
+                        "hevc"
+                    },
+                    "pipe:1",
+                ])
+                .output()
+                .expect("FFmpeg CLI must start");
+            assert!(
+                encoded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&encoded.stderr)
+            );
+            let format = StreamFormat::video_default(width, height).unwrap();
+            let mut decoder = FfmpegDecoder::open(codec, format, FfmpegMode::V4l2Request)
+                .expect("request decoder must open");
+            let packet = EncodedVideoFrame::new(encoded.stdout, 1_234_567, true).unwrap();
+            let mut frames = decoder.decode(&packet).unwrap();
+            frames.extend(decoder.flush().unwrap());
+            assert_eq!(frames.len(), 1);
+            let frame = frames.remove(0);
+            drop(decoder);
+            frame.validate().unwrap();
+            assert_eq!((frame.format.width, frame.format.height), (width, height));
+            assert_eq!(frame.timestamp_us, packet.timestamp_us);
+            assert_eq!(frame.format.pixel_format, PixelFormat::Nv12);
+            assert!(frame.planes.is_empty());
+            assert!(frame.vulkan.is_none());
+            assert!(frame.dmabuf.is_some());
+            assert!(
+                frame
+                    .dmabuf
+                    .as_ref()
+                    .unwrap()
+                    .objects
+                    .iter()
+                    .all(|object| unsafe { libc::fcntl(object.fd, libc::F_GETFD) >= 0 })
+            );
+        }
+    }
+
+    #[test]
+    fn unspecified_metadata_uses_negotiation_but_explicit_sdr_overrides_hdr() {
+        let defaults = StreamFormat {
+            pixel_format: PixelFormat::P010,
+            color_transfer: ColorTransfer::Pq,
+            color_primaries: ColorPrimaries::Bt2020,
+            color_matrix: ColorMatrix::Bt2020,
+            color_range: ColorRange::Full,
+            ..StreamFormat::video_default(1920, 1080).unwrap()
+        };
+        let mut frame = frame::Video::new(Pixel::P010LE, 2, 2);
+        assert_eq!(decoded_metadata(&frame, defaults), defaults);
+        frame.set_color_transfer_characteristic(ffmpeg::color::TransferCharacteristic::BT709);
+        frame.set_color_primaries(ffmpeg::color::Primaries::BT709);
+        frame.set_color_space(ffmpeg::color::Space::BT709);
+        frame.set_color_range(ffmpeg::color::Range::MPEG);
+        let metadata = decoded_metadata(&frame, defaults);
+        assert_eq!(metadata.color_transfer, ColorTransfer::Sdr);
+        assert_eq!(metadata.color_primaries, ColorPrimaries::Bt709);
+        assert_eq!(metadata.color_matrix, ColorMatrix::Bt709);
+        assert_eq!(metadata.color_range, ColorRange::Limited);
+        frame
+            .set_color_transfer_characteristic(ffmpeg::color::TransferCharacteristic::ARIB_STD_B67);
+        frame.set_color_primaries(ffmpeg::color::Primaries::BT2020);
+        assert_eq!(
+            decoded_metadata(&frame, defaults).color_transfer,
+            ColorTransfer::Hlg
+        );
+        frame.set_color_space(ffmpeg::color::Space::BT2020CL);
+        assert_eq!(
+            decoded_metadata(&frame, defaults).color_matrix,
+            defaults.color_matrix
+        );
+        frame.set_color_space(ffmpeg::color::Space::BT2020NCL);
+        unsafe {
+            (*frame.as_mut_ptr()).chroma_location = ffmpeg::chroma::Location::TopLeft.into();
+        }
+        assert_eq!(
+            decoded_metadata(&frame, defaults).chroma_location,
+            ChromaLocation::TopLeft
+        );
+        unsafe {
+            (*frame.as_mut_ptr()).chroma_location = ffmpeg::chroma::Location::Bottom.into();
+        }
+        frame.set_color_primaries(ffmpeg::color::Primaries::SMPTE432);
+        frame.set_color_transfer_characteristic(ffmpeg::color::TransferCharacteristic::Linear);
+        let metadata = decoded_metadata(&frame, defaults);
+        assert_eq!(metadata.chroma_location, defaults.chroma_location);
+        assert_eq!(metadata.color_primaries, defaults.color_primaries);
+        assert_eq!(metadata.color_transfer, defaults.color_transfer);
+    }
+
+    #[test]
+    fn decoded_frames_retain_each_explicit_chroma_location() {
+        let defaults = StreamFormat::video_default(4, 4).unwrap();
+        let mut decoder = decoder_for_synthetic_frames(defaults);
+        for (source, expected) in [
+            (ffmpeg::chroma::Location::Center, ChromaLocation::Center),
+            (ffmpeg::chroma::Location::Left, ChromaLocation::Left),
+            (ffmpeg::chroma::Location::TopLeft, ChromaLocation::TopLeft),
+        ] {
+            let mut decoded = frame::Video::new(Pixel::NV12, 4, 4);
+            unsafe { (*decoded.as_mut_ptr()).chroma_location = source.into() };
+            let output = decoder.convert_frame(&decoded).unwrap();
+            assert_eq!(output.format.chroma_location, expected);
+            assert_eq!(decoder.configured_format.chroma_location, expected);
+            assert_eq!(
+                decoder.pending_format_change.unwrap().chroma_location,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "hardware-only", not(feature = "vulkan")))]
+    fn hardware_only_vulkan_without_validation_rejects_after_format_validation() {
+        let format = StreamFormat::video_default(1920, 1080).unwrap();
+        let invalid = StreamFormat { width: 0, ..format };
+        let error = FfmpegDecoder::open(VideoCodec::H265, invalid, FfmpegMode::Vulkan)
+            .err()
+            .expect("invalid dimensions must reject before device validation");
+        assert!(matches!(error, Error::InvalidFormat(_)), "{error}");
+        let error = FfmpegDecoder::open(VideoCodec::H265, format, FfmpegMode::Vulkan)
+            .err()
+            .expect("hardware-only Vulkan must still require GPU validation");
+        assert!(
+            error
+                .to_string()
+                .contains("hardware-only Vulkan requires native GPU validation support"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn four_four_four_never_opens_non_shared_or_cpu_decoders() {
+        for pixel_format in [PixelFormat::Nv24, PixelFormat::P410] {
+            let metadata = StreamFormat {
+                pixel_format,
+                ..StreamFormat::video_default(1920, 1080).unwrap()
+            };
+            for mode in [
+                FfmpegMode::Cuda,
+                FfmpegMode::Vaapi,
+                FfmpegMode::Software,
+                FfmpegMode::Vulkan,
+                FfmpegMode::V4l2Request,
+            ] {
+                let error = FfmpegDecoder::open(VideoCodec::H265, metadata, mode)
+                    .err()
+                    .expect("4:4:4 must reject before device initialization");
+                assert!(error.to_string().contains(
+                    if cfg!(feature = "hardware-only") && mode == FfmpegMode::Software {
+                        "hardware-only"
+                    } else {
+                        "4:4:4 requires shared Vulkan Video"
+                    }
+                ));
+            }
+            assert!(!cpu_conversion_allowed(metadata, Pixel::NV12));
+        }
+        let metadata = StreamFormat::video_default(1920, 1080).unwrap();
+        for pixel in [
+            ffi::AVPixelFormat::AV_PIX_FMT_NV24,
+            ffi::AVPixelFormat::AV_PIX_FMT_P410LE,
+            ffi::AVPixelFormat::AV_PIX_FMT_YUV444P,
+        ] {
+            assert!(!cpu_conversion_allowed(metadata, Pixel::from(pixel)));
+        }
+    }
+
+    #[test]
+    fn standalone_cpu_recovery_is_limited_to_actual_eight_bit_sdr() {
+        let mut metadata = StreamFormat::video_default(1920, 1080).unwrap();
+        assert!(cpu_conversion_allowed(metadata, Pixel::NV12));
+        assert!(cpu_conversion_allowed(metadata, Pixel::YUV420P));
+        assert!(!cpu_conversion_allowed(metadata, Pixel::P010LE));
+        assert!(!cpu_conversion_allowed(metadata, Pixel::YUV420P10LE));
+        for transfer in [ColorTransfer::Pq, ColorTransfer::Hlg] {
+            metadata.color_transfer = transfer;
+            assert!(!cpu_conversion_allowed(metadata, Pixel::NV12));
+            assert!(!cpu_conversion_allowed(metadata, Pixel::P010LE));
+        }
+        metadata.color_transfer = ColorTransfer::Sdr;
+        metadata.pixel_format = PixelFormat::P010;
+        assert!(!cpu_conversion_allowed(metadata, Pixel::NV12));
+    }
+
+    #[test]
+    fn vaapi_export_failure_transfers_only_eight_bit_sdr() {
+        let mut format = StreamFormat::video_default(1920, 1080).unwrap();
+        assert!(vaapi_cpu_transfer_allowed(
+            FfmpegMode::Vaapi,
+            format,
+            Pixel::NV12
+        ));
+        for mode in [FfmpegMode::Vulkan, FfmpegMode::Cuda, FfmpegMode::Software] {
+            assert!(!vaapi_cpu_transfer_allowed(mode, format, Pixel::NV12));
+        }
+        assert!(!vaapi_cpu_transfer_allowed(
+            FfmpegMode::Vaapi,
+            format,
+            Pixel::P010LE
+        ));
+        format.pixel_format = PixelFormat::P010;
+        assert!(!vaapi_cpu_transfer_allowed(
+            FfmpegMode::Vaapi,
+            format,
+            Pixel::NV12
+        ));
+        format.pixel_format = PixelFormat::Nv12;
+        format.color_transfer = ColorTransfer::Pq;
+        assert!(!vaapi_cpu_transfer_allowed(
+            FfmpegMode::Vaapi,
+            format,
+            Pixel::NV12
+        ));
+
+        let missing_context = frame::Video::empty();
+        let error = map_hardware_frame_to_dmabuf(&missing_context, 0, format, FfmpegMode::Vaapi)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("FFmpeg VAAPI frame DMA-BUF export failed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn hdr_and_ten_bit_never_open_cpu_conversion_decoders() {
+        for transfer in [ColorTransfer::Sdr, ColorTransfer::Pq, ColorTransfer::Hlg] {
+            let format = StreamFormat {
+                pixel_format: PixelFormat::P010,
+                color_transfer: transfer,
+                ..StreamFormat::video_default(1920, 1080).unwrap()
+            };
+            for mode in [FfmpegMode::Cuda, FfmpegMode::Software] {
+                assert!(FfmpegDecoder::open(VideoCodec::H265, format, mode).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_output_has_no_foreign_gpu_metadata() {
+        let format = StreamFormat::video_default(2, 2).unwrap();
+        let Some(mut decoder) = software_decoder(VideoCodec::H264, format) else {
+            return;
+        };
+        let decoded = frame::Video::new(Pixel::NV12, 2, 2);
+        let output = decoder.convert_frame(&decoded).unwrap();
+        assert_eq!(output.planes.len(), 2);
+        assert!(output.dmabuf.is_none());
+        assert!(output.vulkan.is_none());
+        output.validate().unwrap();
+    }
+
+    #[test]
+    fn all_required_software_decoders_are_linked() {
+        initialize_ffmpeg().unwrap();
+        for codec in [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1] {
+            assert!(ffmpeg::decoder::find(codec_id(codec)).is_some());
+        }
+    }
+
+    #[test]
+    fn software_av1_requires_a_cpu_decoder() {
+        initialize_ffmpeg().unwrap();
+        let available = ["libdav1d", "libaom-av1"]
+            .into_iter()
+            .any(|name| ffmpeg::decoder::find_by_name(name).is_some());
+        let format = StreamFormat::video_default(64, 64).unwrap();
+        let opened = FfmpegDecoder::open(VideoCodec::Av1, format, FfmpegMode::Software);
+        let probe = super::super::probe_ffmpeg_software(VideoCodec::Av1);
+        if cfg!(feature = "hardware-only") {
+            assert!(opened.err().unwrap().to_string().contains("hardware-only"));
+            assert!(probe.unwrap_err().contains("hardware-only"));
+            return;
+        }
+        if !available {
+            assert!(matches!(opened, Err(Error::Unavailable { .. })));
+            assert!(probe.is_err());
+            return;
+        }
+        assert!(probe.is_ok());
+        let mut decoder = opened.unwrap();
+        assert!(matches!(
+            decoder.decoder.codec().unwrap().name(),
+            "libdav1d" | "libaom-av1"
+        ));
+        let packet = EncodedVideoFrame::new(
+            vec![
+                0x12, 0x00, 0x0a, 0x0a, 0x00, 0x00, 0x00, 0x02, 0xaf, 0xff, 0x9b, 0x5f, 0x20, 0x08,
+                0x32, 0x0e, 0x10, 0x00, 0xc0, 0x00, 0x00, 0x02, 0x80, 0x00, 0x00, 0x0a, 0x05, 0x77,
+                0x64, 0x80,
+            ],
+            12_345,
+            true,
+        )
+        .unwrap();
+        let mut frames = decoder.decode(&packet).unwrap();
+        frames.extend(decoder.flush().unwrap());
+        assert_eq!(frames.len(), 1);
+        assert_eq!((frames[0].format.width, frames[0].format.height), (64, 64));
+        assert_eq!(frames[0].timestamp_us, 12_345);
+        assert_eq!(frames[0].format.pixel_format, PixelFormat::Nv12);
+        assert!(frames[0].dmabuf.is_none());
+        assert!(frames[0].vulkan.is_none());
+        frames[0].validate().unwrap();
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn shared_hevc_snapshot(pixel_format: PixelFormat) {
+        let owner =
+            crate::SharedVulkanDevice::create().expect("shared Vulkan device must initialize");
+        let mut format = StreamFormat::video_default(256, 144).unwrap();
+        format.pixel_format = pixel_format;
+        assert!(
+            owner.supports_format(VideoCodec::H265, pixel_format, 256, 144),
+            "requested HEVC profile must be supported"
+        );
+        let encoded = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=256x144:rate=60",
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                match pixel_format {
+                    PixelFormat::Nv12 => "yuv420p",
+                    PixelFormat::P010 => "yuv420p10le",
+                    PixelFormat::Nv24 => "yuv444p",
+                    PixelFormat::P410 => "yuv444p10le",
+                    _ => panic!("unsupported HEVC snapshot fixture"),
+                },
+                "-c:v",
+                "libx265",
+                "-x265-params",
+                "log-level=error:pools=1",
+                "-f",
+                "hevc",
+                "pipe:1",
+            ])
+            .output()
+            .expect("FFmpeg CLI with libx265 must start");
+        assert!(
+            encoded.status.success(),
+            "HEVC sample encode failed: {}",
+            String::from_utf8_lossy(&encoded.stderr)
+        );
+        let mut decoder =
+            FfmpegDecoder::open_shared(VideoCodec::H265, format, Arc::clone(&owner)).unwrap();
+        let packet = EncodedVideoFrame::new(encoded.stdout, 1, true).unwrap();
+        let mut frames = decoder.decode(&packet).unwrap();
+        frames.extend(decoder.flush().unwrap());
+        assert_eq!(frames.len(), 1);
+        let frame = frames.remove(0);
+        frame.validate().unwrap();
+        assert!(frame.planes.is_empty());
+        assert!(frame.dmabuf.is_none());
+        assert_eq!(frame.format.pixel_format, format.pixel_format);
+        let vulkan = frame.vulkan.as_ref().unwrap();
+        assert_eq!(vulkan.device, owner.info().device);
+        assert!(vulkan.completed_gpu_copy());
+        assert_eq!(vulkan.images.len(), 2);
+        let divisor = if pixel_format.is_444() { 1 } else { 2 };
+        assert_eq!(vulkan.images[1].width, format.width / divisor);
+        assert_eq!(vulkan.images[1].height, format.height / divisor);
+        assert_eq!(
+            vulkan.images[1].format,
+            if pixel_format.is_ten_bit() {
+                ash::vk::Format::R16G16_UNORM
+            } else {
+                ash::vk::Format::R8G8_UNORM
+            }
+            .as_raw()
+        );
+        assert!(
+            vulkan.images.iter().all(
+                |image| image.layout == ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL.as_raw()
+            )
+        );
+        assert!(vulkan.download_nv12().is_err());
+        drop(decoder);
+        let producer = crate::LinuxGpuFrameProducer::new(3).unwrap();
+        let retained = producer
+            .frame(frame)
+            .expect("GPU-only snapshot must publish after decoder destruction");
+        drop(owner);
+        drop(retained);
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "opt-in: requires a Vulkan Video HEVC GPU with an isolated Qt graphics queue and FFmpeg CLI/libx265"]
+    fn shared_vulkan_hevc_nv12_gpu_only() {
+        shared_hevc_snapshot(PixelFormat::Nv12);
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "opt-in: requires a Vulkan Video HEVC Main10 GPU with an isolated Qt graphics queue and FFmpeg CLI/libx265"]
+    fn shared_vulkan_hevc_p010_gpu_only() {
+        shared_hevc_snapshot(PixelFormat::P010);
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "opt-in: requires Vulkan Video HEVC Range Extensions 8-bit 4:4:4 GPU support, an isolated Qt graphics queue and FFmpeg CLI/libx265"]
+    fn shared_vulkan_hevc_nv24_gpu_only() {
+        shared_hevc_snapshot(PixelFormat::Nv24);
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "opt-in: requires Vulkan Video HEVC Range Extensions 10-bit 4:4:4 GPU support, an isolated Qt graphics queue and FFmpeg CLI/libx265"]
+    fn shared_vulkan_hevc_p410_gpu_only() {
+        shared_hevc_snapshot(PixelFormat::P410);
+    }
+
+    #[test]
+    #[ignore = "requires the FFmpeg CLI and local Vulkan/CUDA video hardware"]
+    fn local_hardware_decodes_all_required_codecs() {
+        for codec in [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1] {
+            let (encoder, muxer, codec_options): (&str, &str, &[&str]) = match codec {
+                VideoCodec::H264 => ("libx264", "h264", &["-tune", "zerolatency"]),
+                VideoCodec::H265 => (
+                    "libx265",
+                    "hevc",
+                    &["-x265-params", "log-level=error:pools=1"],
+                ),
+                VideoCodec::Av1 => ("libsvtav1", "obu", &["-preset", "13"]),
+            };
+            let mut command = Command::new("ffmpeg");
+            command.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:size=256x144:rate=60",
+                "-frames:v",
+                "1",
+                "-c:v",
+                encoder,
+            ]);
+            command.args(codec_options);
+            let encoded = command
+                .args(["-f", muxer, "pipe:1"])
+                .output()
+                .expect("FFmpeg CLI must start");
+            assert!(
+                encoded.status.success(),
+                "sample encode failed for {}: {}",
+                codec.label(),
+                String::from_utf8_lossy(&encoded.stderr)
+            );
+            assert!(!encoded.stdout.is_empty());
+
+            for mode in [FfmpegMode::Vulkan, FfmpegMode::Cuda] {
+                let frame = (|| {
+                    let format = StreamFormat::video_default(256, 144)?;
+                    let mut decoder = FfmpegDecoder::open(codec, format, mode)?;
+                    let packet = EncodedVideoFrame::new(encoded.stdout.clone(), 1, true)?;
+                    let mut frames = decoder.decode(&packet)?;
+                    frames.extend(decoder.flush()?);
+                    if frames.len() != 1 {
+                        return Err(Error::backend(
+                            Subsystem::Ffmpeg,
+                            format!("expected one frame, received {}", frames.len()),
+                        ));
+                    }
+                    Ok(frames.remove(0))
+                })()
+                .unwrap_or_else(|error: Error| {
+                    panic!("{} failed via {}: {error}", codec.label(), mode.label())
+                });
+                eprintln!("{} decoded via {}", codec.label(), mode.label());
+                frame.validate().unwrap();
+                assert_eq!(
+                    (frame.format.width, frame.format.height),
+                    (256, 144),
+                    "{} dimensions changed via {}",
+                    codec.label(),
+                    mode.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the FFmpeg CLI with libx264; run under --features linux-ffmpeg-bundled"]
+    fn ffmpeg_software_decoder_reports_a_midstream_resolution_change() {
+        let encode = |width: u32, height: u32| {
+            let output = Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("testsrc=size={width}x{height}:rate=30"),
+                    "-frames:v",
+                    "1",
+                    "-c:v",
+                    "libx264",
+                    "-tune",
+                    "zerolatency",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "h264",
+                    "pipe:1",
+                ])
+                .output()
+                .expect("FFmpeg CLI must start");
+            assert!(
+                output.status.success(),
+                "sample encode failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!output.stdout.is_empty());
+            output.stdout
+        };
+
+        initialize_ffmpeg().unwrap();
+        let initial = encode(256, 144);
+        let resized = encode(320, 180);
+        let mut decoder = FfmpegDecoder::open(
+            VideoCodec::H264,
+            StreamFormat::video_default(256, 144).unwrap(),
+            FfmpegMode::Software,
+        )
+        .unwrap();
+
+        let mut observed = Vec::new();
+        let mut changes = Vec::new();
+        for (payload, timestamp) in [(initial, 1_u64), (resized, 2)] {
+            let packet = EncodedVideoFrame::new(payload, timestamp, true).unwrap();
+            observed.extend(
+                decoder
+                    .decode(&packet)
+                    .unwrap()
+                    .into_iter()
+                    .map(|frame| (frame.format.width, frame.format.height)),
+            );
+            changes.extend(
+                decoder
+                    .take_format_change()
+                    .map(|format| (format.width, format.height)),
+            );
+        }
+        observed.extend(
+            decoder
+                .flush()
+                .unwrap()
+                .into_iter()
+                .map(|frame| (frame.format.width, frame.format.height)),
+        );
+        changes.extend(
+            decoder
+                .take_format_change()
+                .map(|format| (format.width, format.height)),
+        );
+
+        assert!(
+            observed.contains(&(256, 144)),
+            "the first packet must decode at its own size: {observed:?}"
+        );
+        assert!(
+            observed.contains(&(320, 180)),
+            "the resized packet must decode at the new size: {observed:?}"
+        );
+        assert_eq!(
+            changes,
+            vec![(320, 180)],
+            "the decoder must report exactly the resized format as a change"
+        );
+    }
+}

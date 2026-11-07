@@ -1,0 +1,10 @@
+[package]
+name = "opennow-awdl-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Bounded privileged AWDL suppression lease service"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
