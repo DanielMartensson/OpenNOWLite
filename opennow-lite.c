@@ -18,6 +18,13 @@
  * and the seat's input is submitted back through
  * opennow_streamer_submit_key / opennow_streamer_submit_mouse_*.
  *
+ * By default the window asks for no system cursor: weston's desktop-shell
+ * draws its arrow above every window and the streamed picture already carries
+ * the game's own pointer, so the arrow was that pointer's laggier duplicate.
+ * Asking for none maps the desktop's sprite away while the seat's pointer is
+ * inside the game, which leaves exactly one pointer; --show-cursor keeps the
+ * arrow for a screen that is meant to show both.
+ *
  * Markers (grep -a):
  *   opennowlite: window ready
  *   opennowlite: pipeline playing                          (test pattern)
@@ -86,6 +93,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 #include <wayland-client.h>
@@ -187,6 +195,18 @@ static long ms_since(const struct timespec *then)
  * the log stays readable over an hour. */
 static bool debug_input;
 static unsigned long input_timed;
+
+/* The seat's desktop arrow. weston's desktop-shell client draws this arrow
+ * above every window, and a seat complaint was that the picture then carries
+ * two pointers: the game's own, drawn inside the streamed pixels, and weston's
+ * arrow on top of them - one cursor the game already publishes plus a
+ * laggier duplicate of it. The streamer never draws over this window, so the
+ * arrow is nobody's but the desktop's own: a client that asks for no cursor
+ * over its surface (set_cursor with no surface, the CURSOR_BLANK path the
+ * client library itself uses) maps the pointer's sprite away, which leaves
+ * exactly the pointer the game drew. --show-cursor keeps the arrow for a
+ * screen that is meant to show both. */
+static bool show_cursor;
 static long media_dead_seconds;
 static guint64 media_watch_units;
 static struct timespec media_watch_at;
@@ -313,9 +333,17 @@ static const struct wl_keyboard_listener keyboard_listener = {
 static void ptr_enter(void *data, struct wl_pointer *ptr, uint32_t serial,
                       struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy)
 {
-    (void)ptr;
     struct lite *a = data;
     a->enter_serial = serial;
+    if (!show_cursor) {
+        /* no cursor over this window: the desktop keeps its arrow on
+         * surfaces this client does not speak for, and asking for none
+         * here maps that sprite away for as long as the seat's pointer
+         * is over the game's own picture */
+        wl_pointer_set_cursor(ptr, serial, NULL, 0, 0);
+        if (!a->pointer_surface)
+            fprintf(stderr, "opennowlite-input: system cursor hidden over the window\n");
+    }
     a->pointer_surface = surface;
     a->pointer_x = wl_fixed_to_double(sx);
     a->pointer_y = wl_fixed_to_double(sy);
@@ -1713,6 +1741,9 @@ typedef struct Media {
     gboolean audio_ready;
     GstAppSrc *video_source;
     GstAppSrc *audio_source;
+    /* Set on the main thread before the pipeline is torn down and read by the
+     * streamer's media thread; the lock below makes that read safe. */
+    volatile gboolean stopping;
     guint64 video_base;
     guint64 audio_base;
     guint64 video_units;
@@ -1728,9 +1759,45 @@ typedef struct Media {
     long long audio_dump_left;
     guint64 audio_dump_frames;
     guint64 audio_dump_bytes;
+    void *opus_lib;
+    void *opus_dec;
+    int (*opus_nb_samples)(const unsigned char *, int, int);
+    int (*opus_decode)(void *, const unsigned char *, int, short *, int, int);
+    guint64 audio_decoded;
+    guint64 audio_failed;
+    /* the decoded-level probe: what the client actually handed the sink, so a
+     * silent monitor can be attributed to the decode or to the sink in one
+     * round instead of two. */
+    guint64 audio_peak;
+    guint64 audio_nonzero;
+    guint64 audio_samples;
+    /* the decoded-frame probe: what reached the video sink, beside the tap's
+     * own count, so a starved decoder reads as a low rate here while the tap
+     * still counts its units. */
+    guint64 video_presented;
+    guint64 video_presented_at;
+    long video_probe_at;
 } Media;
 
 static Media media;
+/* Serializes the tap's pushes against the teardown. The encoded-media
+ * callback runs on the streamer's own thread, and the pipeline is destroyed on
+ * the main thread; without this, a push that arrives during shutdown reaches
+ * an appsrc that stop_pipeline has already unref'd (r2.5's rounds ended with
+ * `gst_app_src_push_internal: assertion 'GST_IS_APP_SRC (appsrc)' failed`). */
+static GMutex media_lock;
+
+/* Counts the buffers that reach the sink's sink pad. `video units` is what the
+ * tap handed to appsrc; this is what the decoder produced and the sink was
+ * given, so the two together separate a slow stream from a slow decoder. */
+static GstPadProbeReturn on_video_frame(GstPad *pad, GstPadProbeInfo *info,
+                                        gpointer user)
+{
+    (void)pad;
+    (void)info;
+    ((Media *)user)->video_presented++;
+    return GST_PAD_PROBE_OK;
+}
 
 /* A session whose media stopped is not a session that is worth holding: measured
  * on the r1.9 round of Nov 8, the vendor kept the session alive and kept
@@ -1748,6 +1815,23 @@ static void media_watch(void)
 {
     if (media_dead_seconds <= 0 || !media.video_units)
         return;
+
+    /* What the decoder actually produced, once per five seconds, beside the
+     * tap's own count: a healthy `units` with a low rate here means the
+     * decoder or the sink is the slow part, not the stream. */
+    const long now = ms_since(&app.capture_started);
+    if (now - media.video_probe_at >= 5000) {
+        const long span = now - media.video_probe_at;
+        const guint64 got = media.video_presented - media.video_presented_at;
+        fprintf(stderr,
+                "opennowlite: video decoded=%llu in %ldms (%.1f fps) units=%llu at +%lds\n",
+                (unsigned long long)got, span,
+                span > 0 ? (double)got * 1000.0 / (double)span : 0.0,
+                (unsigned long long)media.video_units, now / 1000L);
+        media.video_presented_at = media.video_presented;
+        media.video_probe_at = now;
+    }
+
     if (media.video_units != media_watch_units) {
         media_watch_units = media.video_units;
         clock_gettime(CLOCK_MONOTONIC, &media_watch_at);
@@ -1820,7 +1904,7 @@ static void media_audio_teardown(Media *owner)
     fprintf(stderr, "opennowlite: audio chain disabled, video continues\n");
 }
 
-static void media_push_video(Media *owner, const OpenNowStreamerEncodedMedia
+static void media_push_video_locked(Media *owner, const OpenNowStreamerEncodedMedia
                             *packet)
 {
     const guint8 *data = packet->data;
@@ -1915,25 +1999,82 @@ static void media_push_video(Media *owner, const OpenNowStreamerEncodedMedia
     }
 }
 
-static void media_push_audio(Media *owner,
+/* The tap's entry point: the lock is held for the whole push so the teardown
+ * cannot clear the source under it. */
+static void media_push_video(Media *owner,
+                             const OpenNowStreamerEncodedMedia *packet)
+{
+    g_mutex_lock(&media_lock);
+    if (!owner->stopping && owner->video_source)
+        media_push_video_locked(owner, packet);
+    g_mutex_unlock(&media_lock);
+}
+
+static void media_push_audio_locked(Media *owner,
                             const OpenNowStreamerEncodedMedia *packet)
 {
-    GstBuffer *buffer = gst_buffer_new_allocate(NULL, packet->data_len, NULL);
-    if (!buffer)
-        return;
-    gst_buffer_fill(buffer, 0, packet->data, packet->data_len);
-
     guint32 rate = packet->clock_rate_hz ? packet->clock_rate_hz : 48000u;
     guint64 pts = (guint64)packet->timestamp * GST_SECOND / rate;
     if (!owner->audio_base)
         owner->audio_base = pts + GST_SECOND;
+
+    GstBuffer *buffer = NULL;
+    guint64 duration = GST_SECOND / 200u;
+    if (owner->opus_dec) {
+        /* the raw path: libopus decodes the frame here, and the sink is handed
+         * the shape the seat's own audio test proved audible. The call shapes
+         * are opusprobe's: each packet's own length is asked first, because
+         * opus_decode answers -1 for a frame_size of 0. */
+        short pcm[5760 * 2];
+        int ns = owner->opus_nb_samples(packet->data, (int)packet->data_len,
+                                        (int)rate);
+        if (ns <= 0 || ns > 5760)
+            ns = 240;
+        int got = owner->opus_decode(owner->opus_dec, packet->data,
+                                     (int)packet->data_len, pcm, ns, 0);
+        if (got <= 0) {
+            ++owner->audio_failed;
+            if (owner->audio_failed == 1u)
+                fprintf(stderr,
+                        "opennowlite: audio decode failed (%d) on %zu bytes\n",
+                        got, packet->data_len);
+            else if (owner->audio_failed % 1500u == 0u)
+                fprintf(stderr, "opennowlite: audio decode failed=%llu\n",
+                        (unsigned long long)owner->audio_failed);
+            return;
+        }
+        for (int i = 0; i < got * 2; ++i) {
+            int v = pcm[i];
+            int a = v < 0 ? -v : v;
+            if ((guint64)a > owner->audio_peak)
+                owner->audio_peak = (guint64)a;
+            if (v)
+                ++owner->audio_nonzero;
+        }
+        owner->audio_samples += (guint64)got * 2u;
+        if (owner->audio_units == 0u)
+            fprintf(stderr,
+                    "opennowlite: audio first frame got=%d s0..7=%d %d %d %d %d %d %d %d\n",
+                    got, pcm[0], pcm[1], pcm[2], pcm[3], pcm[4], pcm[5], pcm[6],
+                    pcm[7]);
+        buffer = gst_buffer_new_allocate(NULL, (gsize)got * 2u * 2u, NULL);
+        if (!buffer)
+            return;
+        gst_buffer_fill(buffer, 0, pcm, (gsize)got * 2u * 2u);
+        duration = GST_SECOND * (guint64)got / rate;
+    } else {
+        buffer = gst_buffer_new_allocate(NULL, packet->data_len, NULL);
+        if (!buffer)
+            return;
+        gst_buffer_fill(buffer, 0, packet->data, packet->data_len);
+    }
     GST_BUFFER_PTS(buffer) = pts + GST_SECOND - owner->audio_base;
     /* 5 ms, not 20: the tap delivers ~200 packets a second against 60 video
      * units a second, and the opennow layer's own audio queue says why
      * ("the play queue holds 12 packets of 5 ms"), so an Opus frame off this
      * wire is 5 ms of audio. Naming 20 ms made the audio chain run 4x faster
      * than the clock it was handed. */
-    GST_BUFFER_DURATION(buffer) = GST_SECOND / 200u;
+    GST_BUFFER_DURATION(buffer) = duration;
     if (gst_app_src_push_buffer(owner->audio_source, buffer)
         != GST_FLOW_OK) {
         ++owner->audio_refused;
@@ -1995,10 +2136,31 @@ static void media_push_audio(Media *owner,
             fclose(dump);
         }
     } else if (owner->audio_units % 1500u == 0u) {
-        fprintf(stderr, "opennowlite: audio packets=%llu queued=%llu\n",
+        GstState audio_now = GST_STATE_VOID_PENDING;
+        gst_element_get_state(owner->audio, &audio_now, NULL, 0);
+        fprintf(stderr,
+                "opennowlite: audio packets=%llu queued=%llu decoded_samples=%llu peak=%llu nonzero=%llu state=%d\n",
                 (unsigned long long)owner->audio_units,
-                (unsigned long long)gst_app_src_get_current_level_bytes(owner->audio_source));
+                (unsigned long long)gst_app_src_get_current_level_bytes(owner->audio_source),
+                (unsigned long long)owner->audio_samples,
+                (unsigned long long)owner->audio_peak,
+                (unsigned long long)owner->audio_nonzero,
+                (int)audio_now);
+        owner->audio_peak = 0;
+        owner->audio_nonzero = 0;
+        owner->audio_samples = 0;
     }
+}
+
+/* The tap's entry point: the lock is held for the whole push so the teardown
+ * cannot clear the source under it. */
+static void media_push_audio(Media *owner,
+                             const OpenNowStreamerEncodedMedia *packet)
+{
+    g_mutex_lock(&media_lock);
+    if (!owner->stopping && owner->audio_source)
+        media_push_audio_locked(owner, packet);
+    g_mutex_unlock(&media_lock);
 }
 
 /* This is the hand-off: the streamer does not decode or present anything when
@@ -2087,6 +2249,104 @@ static bool media_source_new(Media *owner, const char *caps_string,
     return true;
 }
 
+/* libpulse names the server through $XDG_RUNTIME_DIR/pulse/native, and this
+ * window runs with XDG_RUNTIME_DIR=/home/weston because that is where weston
+ * keeps its Wayland socket on this seat, so the default lookup finds nothing:
+ * the seat's live PipeWire-Pulse socket is in /run/user/<uid>/pulse/native.
+ * Measured on the r26 round of Nov 8, the audio chain came up and every Opus
+ * packet was carried and counted (`audio packets=219000 queued=313`), yet the
+ * seat's only sink, `alsa_output.platform-sound.hdmi-stereo`, stayed
+ * `SUSPENDED` for the whole session and the user heard nothing at all, while
+ * the same session's picture ran 59 s of frames a second. The client's own log
+ * has no complaint about it because the failure is a warning on the audio bus
+ * far downstream of the tap; running `audiotestsrc ! autoaudiosink` in the
+ * window's exact environment printed `Failed to connect: Connection refused`
+ * from that same autoaudiosink, and in `/run/user/1000` it made the sink
+ * `RUNNING` and the beeps were heard, so the seat plays audio and only this
+ * window's sink was pointed at a socket that is not there. Naming the live one
+ * fixes it from the environment the window already has: PULSE_SERVER=unix:/run/
+ * user/<uid>/pulse/native connected, which is also what `pactl` on the seat
+ * resolves to. Only done when neither PULSE_SERVER nor PULSE_SOCKET was given,
+ * and only when the default socket really is missing. */
+static void pulse_server_default(void)
+{
+    if (getenv("PULSE_SERVER") || getenv("PULSE_SOCKET"))
+        return;
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    char path[256];
+    struct stat st;
+    snprintf(path, sizeof(path), "%s/pulse/native", dir && *dir ? dir : "/tmp");
+    if (stat(path, &st) == 0)
+        return;
+    snprintf(path, sizeof(path), "/run/user/%u/pulse/native",
+             (unsigned)getuid());
+    if (stat(path, &st) != 0)
+        return;
+    char server[320];
+    snprintf(server, sizeof(server), "unix:/run/user/%u/pulse/native",
+             (unsigned)getuid());
+    g_setenv("PULSE_SERVER", server, FALSE);
+    fprintf(stderr, "opennowlite: pulse server set to %s\n", server);
+}
+
+/* The audio leg, decoded here through the seat's own libopus instead of through
+ * the `opusdec` element. Measured on the r28 round of Nov 8: the sink said it
+ * was RUNNING next to the client, while the card's own PipeWire monitor
+ * recorded exact zeros for twelve seconds (`nonzero=0 peak=0`), against
+ * `peak=-8.0 dBFS rms=-11.2 dBFS` for an `audiotestsrc ! pulsesink` test in the
+ * same place, which the user heard. So every Opus frame the client handed the
+ * chain (`audio packets=70500 queued=147`, refused=0) never came out of
+ * opusdec: the sink sat in preroll, the appsrc queue grew to 11.4 MB over
+ * sixteen minutes, and the seat's speakers got silence. The stage-2 client fed
+ * opusdec through an `opusparse` element, but that element is not built on this
+ * seat (`gst-inspect-1.0` lists opusdec and opusenc only), and the parser was
+ * dropped in r1.4 on the belief that one packet per buffer made it unnecessary.
+ * The frames themselves are sound: the offline decode of this same tap read
+ * 106101 of 106101 packets with 0 failures. So decode them here, with the same
+ * libopus and the same call shapes opusprobe proved (ask each packet's length
+ * first - opus_decode answers -1 for a frame_size of 0), and hand the sink the
+ * raw shape the seat's own audio test proved audible: S16LE, 2 channels,
+ * 48 kHz. */
+static bool audio_opus_prepare(Media *owner)
+{
+    if (owner->opus_dec)
+        return true;
+    if (!owner->opus_lib) {
+        owner->opus_lib = dlopen("libopus.so.0", RTLD_NOW | RTLD_GLOBAL);
+        if (!owner->opus_lib) {
+            fprintf(stderr, "opennowlite: audio decode unavailable: %s\n",
+                    dlerror());
+            return false;
+        }
+    }
+    /* the return type is a pointer: declaring it `int` truncated it to 32 bits
+     * (harmless on this non-PIE build, whose heap is below 4 GiB, but undefined
+     * behaviour everywhere else). */
+    void *(*create)(int, int, int *) =
+        (void *(*)(int, int, int *))dlsym(owner->opus_lib,
+                                          "opus_decoder_create");
+    owner->opus_nb_samples = (int (*)(const unsigned char *, int, int))
+        dlsym(owner->opus_lib, "opus_packet_get_nb_samples");
+    owner->opus_decode = (int (*)(void *, const unsigned char *, int, short *,
+                                  int, int))
+        dlsym(owner->opus_lib, "opus_decode");
+    if (!create || !owner->opus_nb_samples || !owner->opus_decode) {
+        fprintf(stderr,
+                "opennowlite: audio decode unavailable: libopus.so.0 is missing a symbol\n");
+        return false;
+    }
+    int err = 0;
+    owner->opus_dec = create(48000, 2, &err);
+    if (!owner->opus_dec || err != 0) {
+        fprintf(stderr,
+                "opennowlite: audio decode unavailable: opus_decoder_create err=%d\n",
+                err);
+        owner->opus_dec = NULL;
+        return false;
+    }
+    return true;
+}
+
 /* Elements are probed rather than assumed: an absent Opus element means this
  * window simply has no audio, and saying so in the log is better than
  * refusing to show the game. This seat's libgstopus.so (the
@@ -2121,6 +2381,20 @@ static bool stream_new(struct lite *a)
         return false;
     }
 
+    /* `sync` is the fix for the frozen picture, and the measurement is the
+     * client's own feed: the window and its pipeline go PLAYING when the
+     * session is ready, but the vendor's prepare then runs for one to two
+     * minutes before the first encoded unit is handed over, so the sink's
+     * clock started long before the first frame existed. With the default
+     * sync=true, a gap of 1 s between PLAYING and the first push leaves the
+     * decoder at 3 output pictures while the tap keeps feeding it 60 units a
+     * second, and a gap of 3 s or 10 s leaves it at 2; the same feed with
+     * `sync` off renders 239 of the 240 units it was given. The sink reads
+     * every buffer as minutes late, and its QoS drops then starve the
+     * stateless decoder. The audio sink is off the clock for the same reason
+     * (its first buffer is ~100 s late), and a live stream is paced by the
+     * wire, not by a clock that started before the first frame existed. */
+    g_object_set(vsink, "sync", FALSE, "qos", FALSE, NULL);
     media.video = gst_pipeline_new("opennowlite-video");
     if (!media.video) {
         gst_object_unref(media.video_source);
@@ -2153,6 +2427,14 @@ static bool stream_new(struct lite *a)
                                         (guintptr)a->surface);
     gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(vsink), 0, 0,
                                            a->width, a->height);
+    /* Count what the decoder hands the sink: the tap counts units, this counts
+     * presented buffers, so a starved decoder is visible without a recording. */
+    GstPad *video_pad = gst_element_get_static_pad(vsink, "sink");
+    if (video_pad) {
+        gst_pad_add_probe(video_pad, GST_PAD_PROBE_TYPE_BUFFER, on_video_frame,
+                          &media, NULL);
+        gst_object_unref(video_pad);
+    }
     a->bus = gst_element_get_bus(media.video);
     /* stage 1's teardown already nulls and unrefs a->pipeline, so it is
      * kept as the same object here. The sink belongs to the pipeline's bin
@@ -2169,12 +2451,35 @@ static bool stream_new(struct lite *a)
     if (!media.audio_ready)
         return true;
 
-    if (!media_source_new(&media, audio_caps_string, 4u << 20, TRUE)) {
+    pulse_server_default();
+
+    const bool audio_raw = audio_opus_prepare(&media);
+    /* Raw S16LE is the shape the seat's own `audiotestsrc ! pulsesink` test
+     * proved audible: the card's monitor carried peak -8.0 dBFS for it and
+     * exact zeros for the opusdec chain. The Opus caps stay for the fallback
+     * where libopus is not loadable. */
+    const char *audio_in_caps = audio_raw
+        ? "audio/x-raw,format=S16LE,layout=interleaved,channels=2,rate=48000"
+        : audio_caps_string;
+    if (!media_source_new(&media, audio_in_caps, 4u << 20, TRUE)) {
         media.audio_ready = false;
         return true;
     }
-    GstElement *decode = gst_element_factory_make("opusdec", NULL);
-    GstElement *audiosink = gst_element_factory_make("autoaudiosink", NULL);
+    GstElement *decode = audio_raw
+        ? NULL : gst_element_factory_make("opusdec", NULL);
+    /* `pulsesink` by name, not through `autoaudiosink`: the seat's own working
+     * audio test is `audiotestsrc ! ... ! audioconvert ! pulsesink`, and this
+     * window's first buffer carries a PTS of zero roughly a hundred seconds
+     * after the pipeline went PLAYING (the vendor's prepare happens after the
+     * window is built), so a clock-synced sink sees every buffer as late. A
+     * live audio stream should be paced by the device, not by a clock the first
+     * buffer is a hundred seconds behind, so `sync` is off. */
+    GstElement *audiosink = gst_element_factory_make("pulsesink", NULL);
+    if (!audiosink)
+        audiosink = gst_element_factory_make("autoaudiosink", NULL);
+    if (audiosink)
+        g_object_set(audiosink, "sync", FALSE, NULL);
+    GstElement *aconv = gst_element_factory_make("audioconvert", NULL);
     /* A bounded queue in front of the decoder: the tap pushes one Opus frame
      * every 5 ms, and if the sink ever stops consuming (preroll that does not
      * finish, a device that disappears) the appsrc's own queue grew without
@@ -2187,11 +2492,13 @@ static bool stream_new(struct lite *a)
         g_object_set(queue, "leaky", 2, "max-size-buffers", 200u,
                      "max-size-bytes", (guint64)0,
                      "max-size-time", (guint64)0, NULL);
-    if (!decode || !audiosink || !queue) {
+    if (!audiosink || !aconv || !queue || (!audio_raw && !decode)) {
         if (decode)
             gst_object_unref(decode);
         if (audiosink)
             gst_object_unref(audiosink);
+        if (aconv)
+            gst_object_unref(aconv);
         if (queue)
             gst_object_unref(queue);
         gst_object_unref(media.audio_source);
@@ -2201,18 +2508,29 @@ static bool stream_new(struct lite *a)
     }
     media.audio = gst_pipeline_new("opennowlite-audio");
     if (!media.audio) {
-        gst_object_unref(decode);
+        if (decode)
+            gst_object_unref(decode);
         gst_object_unref(audiosink);
+        gst_object_unref(aconv);
         gst_object_unref(queue);
         gst_object_unref(media.audio_source);
         media.audio_source = NULL;
         media.audio_ready = false;
         return true;
     }
-    gst_bin_add_many(GST_BIN(media.audio), (GstElement *)media.audio_source,
-                     queue, decode, audiosink, NULL);
-    if (!gst_element_link_many((GstElement *)media.audio_source, queue, decode,
-                               audiosink, NULL)) {
+    if (audio_raw) {
+        gst_bin_add_many(GST_BIN(media.audio), (GstElement *)media.audio_source,
+                         queue, aconv, audiosink, NULL);
+    } else {
+        gst_bin_add_many(GST_BIN(media.audio), (GstElement *)media.audio_source,
+                         queue, decode, aconv, audiosink, NULL);
+    }
+    const gboolean audio_linked = audio_raw
+        ? gst_element_link_many((GstElement *)media.audio_source, queue, aconv,
+                                audiosink, NULL)
+        : gst_element_link_many((GstElement *)media.audio_source, queue, decode,
+                                aconv, audiosink, NULL);
+    if (!audio_linked) {
         fprintf(stderr, "opennowlite: audio chain could not be linked\n");
         gst_element_set_state(media.audio, GST_STATE_NULL);
         gst_object_unref(media.audio);
@@ -2231,7 +2549,9 @@ static bool stream_new(struct lite *a)
     GstState audio_state = GST_STATE_VOID_PENDING;
     GstStateChangeReturn audio_reached =
         gst_element_get_state(media.audio, &audio_state, NULL, 2 * GST_SECOND);
-    fprintf(stderr, "opennowlite: audio pipeline ready set=%d reached=%d state=%d\n",
+    fprintf(stderr,
+            "opennowlite: audio chain %s, pipeline ready set=%d reached=%d state=%d\n",
+            audio_raw ? "libopus->S16LE/2ch/48000" : "opusdec",
             (int)audio_change, (int)audio_reached, (int)audio_state);
     return true;
 }
@@ -2749,7 +3069,7 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [--launch-app-id=ID] [--data-dir DIR] [--fullscreen]\n"
-            "       [--width N] [--height N] [--pipeline DESC] [--test-pattern]\n"
+            "       [--show-cursor] [--width N] [--height N] [--pipeline DESC] [--test-pattern]\n"
             "       [--auto-pilot] [--pilot-at=S] [--pilot-times=N] [--pilot-gap=S]\n"
             "       [--pilot-click] [--pilot-point=WxH]\n"
             "       [--record=FILE] [--record-seconds=S] [--record-from=S] [--poll-attempts=N]\n"
@@ -2762,6 +3082,13 @@ static void usage(const char *argv0)
             "  proven. --data-dir only points the shipped core at another copy\n"
             "  of its data directory; by default it uses this seat's. The seat's\n"
             "  pointer is sent as an absolute position inside the window.\n"
+            "  By default the seat's desktop arrow is not drawn over the window:\n"
+            "  the picture already carries the game's own pointer, and weston's\n"
+            "  arrow on top of the picture was a second, laggier duplicate. A\n"
+            "  client that asks for no cursor over its surface maps the\n"
+            "  desktop's sprite away while the seat's pointer is inside the\n"
+            "  game, leaving exactly the pointer the game drew; --show-cursor\n"
+            "  keeps the arrow for a screen meant to show both.\n"
             "  --poll-attempts=N caps how many times, 2 s apart, the allocated\n"
             "  session is polled while the vendor still reports it preparing;\n"
             "  300 (ten minutes) by default, since a free-tier queue wait was\n"
@@ -2811,6 +3138,7 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
+    g_mutex_init(&media_lock);
     bool test_pattern = false;
     bool fullscreen = false;
     int width = 1920;
@@ -2874,6 +3202,11 @@ int main(int argc, char **argv)
             }
         } else if (strcmp(argv[i], "--fullscreen") == 0) {
             fullscreen = true;
+        } else if (strcmp(argv[i], "--show-cursor") == 0) {
+            /* keep the seat's desktop arrow over the window; by default the
+             * window asks for no cursor and the game's own pointer inside
+             * the picture is the only one the seat then shows */
+            show_cursor = true;
         } else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
             width = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
@@ -3077,8 +3410,25 @@ int main(int argc, char **argv)
                 dump_failed ? " (fclose failed)" : "");
         media.audio_dump = NULL;
     }
-    engine_stop();
-    core_shutdown(core_rpc);
+    /* The media pipeline and the Wayland connection go first. The vendor
+     * teardown below can block for many seconds, and the pilot's SIGKILL then
+     * left weston holding the decoder's dma-bufs (measured Nov 8: 120 leaked
+     * videobuf2 buffers, 439 MB of the 512 MB CMA). waylandsink only destroys
+     * its wl_surface and releases those buffers while the display is still
+     * connected, so the sink must reach NULL before wl_display_disconnect and
+     * both before the vendor teardown. */
+    /* The tap runs on the streamer's thread and can still be inside a push
+     * when the window is torn down; r2.5's rounds ended with
+     * `gst_app_src_push_internal: assertion 'GST_IS_APP_SRC (appsrc)' failed`
+     * and `video unit not queued` because the tap pushed into an appsrc that
+     * stop_pipeline had already unref'd. Taking the lock and clearing both
+     * sources here means the wrappers cannot enter a push once this point is
+     * reached, so no push can touch an appsrc that is being destroyed. */
+    g_mutex_lock(&media_lock);
+    media.stopping = TRUE;
+    media.video_source = NULL;
+    media.audio_source = NULL;
+    g_mutex_unlock(&media_lock);
     if (media.audio) {
         gst_element_set_state((GstElement *)media.audio, GST_STATE_NULL);
         if (media.audio_bus) {
@@ -3090,5 +3440,7 @@ int main(int argc, char **argv)
     }
     stop_pipeline(&app);
     wl_display_disconnect(app.display);
+    engine_stop();
+    core_shutdown(core_rpc);
     return 0;
 }
