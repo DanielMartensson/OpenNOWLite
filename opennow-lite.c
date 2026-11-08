@@ -187,6 +187,9 @@ static long ms_since(const struct timespec *then)
  * the log stays readable over an hour. */
 static bool debug_input;
 static unsigned long input_timed;
+static long media_dead_seconds;
+static guint64 media_watch_units;
+static struct timespec media_watch_at;
 
 static void note_submit(const char *kind, const struct timespec *at)
 {
@@ -1727,6 +1730,37 @@ typedef struct Media {
 
 static Media media;
 
+/* A session whose media stopped is not a session that is worth holding: measured
+ * on the r1.9 round of Nov 8, the vendor kept the session alive and kept
+ * answering input - the pilot logged jiggle 186 at +1142 s, `submit no=192 at
+ * +1142019ms took 5us` - while its media had already stopped at
+ * `NVST rx-stats elapsed=460.1s ... frames=26917` and `video units=26400 queued=0`,
+ * so 680 further seconds of the round's budget carried one frame and nothing
+ * else. A round like that is over: the pilot starts the next one, and the next
+ * one pays its own vendor prepare and re-drives Steam's launch dialog, which is
+ * what the hour needs. So the client watches its own hand-over count: once the
+ * picture has started, `--media-dead=S` ends the session when the count has not
+ * advanced for S seconds, and it does that with the client's own tally rather
+ * than the streamer's, because the tally is the client's own state. */
+static void media_watch(void)
+{
+    if (media_dead_seconds <= 0 || !media.video_units)
+        return;
+    if (media.video_units != media_watch_units) {
+        media_watch_units = media.video_units;
+        clock_gettime(CLOCK_MONOTONIC, &media_watch_at);
+        return;
+    }
+    long idle = ms_since(&media_watch_at);
+    if (idle < media_dead_seconds * 1000L)
+        return;
+    fprintf(stderr,
+            "opennowlite: media stopped at units=%llu for %lds at +%lds -- ending the session\n",
+            (unsigned long long)media.video_units, idle / 1000L,
+            ms_since(&app.capture_started) / 1000L);
+    running = 0;
+}
+
 /* The audio pipeline has its own bus. Errors on it used to be invisible, so
  * this reports them the same way the video bus reports its own and names the
  * chain, because "pipeline error" alone would not say which one stopped. Every
@@ -1900,7 +1934,7 @@ static void media_push_audio(Media *owner,
             owner->audio_dump_bytes += (guint64)packet->data_len;
             if (owner->audio_dump_frames % 6000u == 0u)
                 fprintf(stderr,
-                        "opennowlite-audio: witness frames=%llu bytes=%llu at +%lds\n",
+                        "opennowlite-audio: witness frames=%llu bytes=%llu at +%ldms\n",
                         (unsigned long long)owner->audio_dump_frames,
                         (unsigned long long)owner->audio_dump_bytes,
                         ms_since(&app.capture_started));
@@ -2495,6 +2529,43 @@ static void pilot_send(struct lite *a)
         ++a->pilot_steps;
         return;
     }
+    if (pilot_press_key[press] == 0x100u) {
+        /* an entry armed with `:c` is a left click rather than a key: what the
+         * character screen of the r20 round acted on was the platform's Select
+         * and a click, and in absolute mode a click cannot land without a
+         * position, so the position goes first and the vendor keeps the order.
+         * --pilot-click's single click at the end of the list already does this
+         * pairing; the list just lets it happen at a stated second. */
+        double point_x = (double)a->pilot_point_x;
+        double point_y = (double)a->pilot_point_y;
+        if (point_x <= 0.0)
+            point_x = (double)a->width / 2.0;
+        if (point_y <= 0.0)
+            point_y = (double)a->height / 2.0;
+        if (pressed)
+            pointer_submit(a, point_x, point_y);
+        struct timespec at;
+        bool timed = debug_input && input_timed < 400u;
+        if (timed)
+            clock_gettime(CLOCK_MONOTONIC, &at);
+        OpenNowStreamerStatus status =
+            streamer.button(streamer.engine, 1u, pressed);
+        if (timed)
+            note_submit("click", &at);
+        if (status == OPENNOW_STREAMER_OK)
+            ++a->submits;
+        else if (a->input_refused++ == 0u)
+            fprintf(stderr, "opennowlite-pilot: click refused (%d)\n",
+                    (int)status);
+        ++a->pilot_steps;
+        if (!pressed)
+            return;
+        ++a->pilot_presses;
+        fprintf(stderr,
+                "opennowlite-pilot: click %lu x=%.0f y=%.0f at +%lds due=+%lds\n",
+                a->pilot_presses, point_x, point_y, elapsed, due);
+        return;
+    }
     struct timespec at;
     bool timed = debug_input && input_timed < 400u;
     if (timed)
@@ -2595,7 +2666,13 @@ static unsigned long pilot_list_parse(const char *list)
             value = 0;
         const char *comma = strchr(list, ',');
         const char *stop = comma ? comma : list + strlen(list);
-        uint16_t key = 0x0du;
+        /* an entry with no suffix is a pointer move, which is what a keep
+         * clock wants: measured on the r20 round of Nov 8, an entry armed as
+         * a plain second presses Return, and once the game is at its
+         * character screen Return is the game's own text chat, so 250 of them
+         * every --pilot-gap seconds typed newlines into a chat box instead of
+         * driving anything. */
+        uint16_t key = 0x00u;
         const char *colon = strchr(list, ':');
         if (colon && colon < stop) {
             switch (colon[1]) {
@@ -2604,6 +2681,21 @@ static unsigned long pilot_list_parse(const char *list)
                 break;
             case 'r':
                 key = 0x0du;
+                break;
+            /* measured on the r20 round of Nov 8: Destiny 2's title screen
+             * says `PRESS [Return] TO PLAY`, but once the game is at its
+             * character screen Return is the game's own text chat (`Press
+             * enter to open text chat`), so the Return armed at +217s and
+             * every 5 s after typed into chat and the character screen sat
+             * there from +220 s to +300 s of session. What that screen acts
+             * on is Space, the platform's Select, and a click. */
+            case 's':
+                key = 0x20u;
+                break;
+            /* not a key: the marker pilot_send turns into a left click at
+             * --pilot-point, the middle by default. */
+            case 'c':
+                key = 0x100u;
                 break;
             default:
                 return 0u;
@@ -2630,6 +2722,7 @@ static void usage(const char *argv0)
             "       [--pilot-click] [--pilot-point=WxH]\n"
             "       [--record=FILE] [--record-seconds=S] [--poll-attempts=N]\n"
             "       [--debug-input] [--debug-audio=FILE] [--debug-audio-seconds=S]\n"
+            "       [--media-dead=S]\n"
             "  the default launch opens the seat's signed-in session and streams\n"
             "  the game into the app's own Wayland window; --test-pattern, or\n"
             "  --pipeline, plays a test pattern in that same window with no\n"
@@ -2655,7 +2748,9 @@ static void usage(const char *argv0)
             "  With --auto-pilot the app drives the cloud game's own notices: it\n"
             "  presses once per notice at --pilot-at, a comma list of seconds\n"
             "  after the stream starts, each optionally followed by the key the\n"
-            "  notice names (`63:r,212:r` by default, r is Return and e Escape).\n"
+            "  notice names (`63:r,212:r` by default, r is Return, e Escape,\n"
+            "  s Space and c a left click at --pilot-point; an entry with no\n"
+            "  suffix is a pointer move).\n"
             "  A clock that presses twice per notice closes the host's own\n"
             "  windows, and keys after the notice list are measured to fail:\n"
             "  the Escape armed for the SIGN UP notice opened Destiny 2's own\n"
@@ -2760,6 +2855,15 @@ int main(int argc, char **argv)
             /* the sound of the stream, kept so it can be analysed after the
              * session instead of listened for during one */
             audio_dump_path = argv[i] + 14;
+        } else if (strncmp(argv[i], "--media-dead=", 13) == 0) {
+            /* a launch that stopped carrying media ends its own session */
+            media_dead_seconds = atoi(argv[i] + 13);
+            if (media_dead_seconds < 0 || media_dead_seconds > 900) {
+                fprintf(stderr,
+                        "opennowlite: --media-dead wants 0..900 seconds\n");
+                usage(argv[0]);
+                return 2;
+            }
         } else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -2882,7 +2986,7 @@ int main(int argc, char **argv)
         if (!drain_audio_bus(&media))
             media_audio_teardown(&media);
         pilot_send(&app);
-
+        media_watch();
         wl_display_dispatch_pending(app.display);
         wl_display_flush(app.display);
 
