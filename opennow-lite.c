@@ -1721,6 +1721,8 @@ typedef struct Media {
     guint64 audio_refused;
     FILE *record;
     long long record_units_left;
+    long long record_from_left;
+    gboolean record_window_open;
     guint64 recorded_bytes;
     FILE *audio_dump;
     long long audio_dump_left;
@@ -1849,6 +1851,28 @@ static void media_push_video(Media *owner, const OpenNowStreamerEncodedMedia
         return;
     }
     ++owner->video_units;
+    if (owner->record && owner->record_from_left > 0LL) {
+        /* --record-from=S: the units before the window are counted and dropped,
+         * which is what lets a round witness the part of a session after the
+         * first few minutes. That is the part the r22 rounds never got: every
+         * round of Nov 8 recorded its first 420 s while its media died at
+         * +930 s, +1 080 s and +1 220 s of session (the deaths read off the
+         * client's own tally: `video units=55154` while `rx-stats
+         * elapsed=930.2s frames=55152`), so the six minutes the game had to
+         * act in - the pilot's acts at +602s, +702s and +802s and the media's
+         * own death at +930s - were unwitnessed and only the loading screen at
+         * +240 s to +420 s was ever readable. The window is written as a raw
+         * stream that starts mid-GOP, so the first frames up to the next
+         * keyframe are not decodable and say so when the storyboard is read. */
+        --owner->record_from_left;
+        if (owner->record_from_left == 0LL) {
+            owner->record_window_open = true;
+            fprintf(stderr,
+                    "opennowlite: witness window opens at media unit %llu at +%lds\n",
+                    (unsigned long long)owner->video_units,
+                    ms_since(&app.capture_started) / 1000L);
+        }
+    }
     if (owner->record && owner->record_units_left > 0LL) {
         /* the witness: the tap's units are whole H.264 access units with their
          * start codes, so writing them out in order gives a raw stream ffmpeg
@@ -2720,7 +2744,7 @@ static void usage(const char *argv0)
             "       [--width N] [--height N] [--pipeline DESC] [--test-pattern]\n"
             "       [--auto-pilot] [--pilot-at=S] [--pilot-times=N] [--pilot-gap=S]\n"
             "       [--pilot-click] [--pilot-point=WxH]\n"
-            "       [--record=FILE] [--record-seconds=S] [--poll-attempts=N]\n"
+            "       [--record=FILE] [--record-seconds=S] [--record-from=S] [--poll-attempts=N]\n"
             "       [--debug-input] [--debug-audio=FILE] [--debug-audio-seconds=S]\n"
             "       [--media-dead=S]\n"
             "  the default launch opens the seat's signed-in session and streams\n"
@@ -2765,7 +2789,15 @@ static void usage(const char *argv0)
             "  middle by default, 3 s after the last event. --record also writes\n"
             "  the first --record-seconds of picture into FILE as a raw H.264\n"
             "  stream, which is how a screen nobody is looking at can still be\n"
-            "  checked afterwards.\n",
+            "  checked afterwards, and --record-from=S starts that window S\n"
+            "  seconds into the session rather than at its start. Measured on\n"
+            "  the r22 rounds of Nov 8, the window that matters is not the first\n"
+            "  one: every round recorded its first 420 s and showed Destiny 2's\n"
+            "  loading screen from +240 s to +420 s, while its media died at\n"
+            "  +930 s, +1 080 s and +1 220 s of session and its acts ran at\n"
+            "  +602s, +702s and +802s - a window no witness ever covered. The\n"
+            "  window is a raw stream that starts mid-GOP, so the frames up to\n"
+            "  its next keyframe are not decodable.\n",
             argv0);
 }
 
@@ -2786,6 +2818,7 @@ int main(int argc, char **argv)
     int pilot_point_y = 0;
     const char *record_path = NULL;
     int record_seconds = 120;
+    int record_from_seconds = 0;
     const char *audio_dump_path = NULL;
     int audio_dump_seconds = 60;
     const char *pipeline =
@@ -2822,6 +2855,8 @@ int main(int argc, char **argv)
             record_path = argv[i] + 9;
         } else if (strncmp(argv[i], "--record-seconds=", 17) == 0) {
             record_seconds = atoi(argv[i] + 17);
+        } else if (strncmp(argv[i], "--record-from=", 14) == 0) {
+            record_from_seconds = atoi(argv[i] + 14);
         } else if (strncmp(argv[i], "--pilot-point=", 14) == 0) {
             if (sscanf(argv[i] + 14, "%dx%d", &pilot_point_x,
                        &pilot_point_y) != 2) {
@@ -2936,6 +2971,8 @@ int main(int argc, char **argv)
     if (record_path) {
         if (record_seconds < 1 || record_seconds > 7200)
             record_seconds = 120;
+        if (record_from_seconds < 0 || record_from_seconds > 7200)
+            record_from_seconds = 0;
         media.record = fopen(record_path, "wb");
         if (!media.record) {
             fprintf(stderr, "opennowlite: cannot open the record file %s: %s\n",
@@ -2943,8 +2980,14 @@ int main(int argc, char **argv)
             return 1;
         }
         media.record_units_left = (long long)record_seconds * 60LL;
-        fprintf(stderr, "opennowlite: recording %d s of picture into %s\n",
-                record_seconds, record_path);
+        media.record_from_left = (long long)record_from_seconds * 60LL;
+        if (record_from_seconds > 0)
+            fprintf(stderr,
+                    "opennowlite: recording %d s of picture from +%d s into %s\n",
+                    record_seconds, record_from_seconds, record_path);
+        else
+            fprintf(stderr, "opennowlite: recording %d s of picture into %s\n",
+                    record_seconds, record_path);
     }
 
     if (audio_dump_path) {
