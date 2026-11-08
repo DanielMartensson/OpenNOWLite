@@ -1863,7 +1863,14 @@ static void media_push_video(Media *owner, const OpenNowStreamerEncodedMedia
          * own death at +930s - were unwitnessed and only the loading screen at
          * +240 s to +420 s was ever readable. The window is written as a raw
          * stream that starts mid-GOP, so the first frames up to the next
-         * keyframe are not decodable and say so when the storyboard is read. */
+         * keyframe are not decodable and say so when the storyboard is read.
+         * The pair of branches is one chain and not two: the r23 round of Nov
+         * 8 armed --record-from=420 with the skip as its own if and the write
+         * as a second one, so a skipped unit fell through to the write and the
+         * round recorded the first 25200 units of picture anyway, printing
+         * `recorded bytes=225291447 units_left=0` BEFORE its
+         * `witness window opens at media unit 25200 at +439s` line, while the
+         * window it was meant to witness wrote nothing. */
         --owner->record_from_left;
         if (owner->record_from_left == 0LL) {
             owner->record_window_open = true;
@@ -1873,7 +1880,8 @@ static void media_push_video(Media *owner, const OpenNowStreamerEncodedMedia
                     ms_since(&app.capture_started) / 1000L);
         }
     }
-    if (owner->record && owner->record_units_left > 0LL) {
+    if (owner->record && owner->record_from_left == 0LL
+        && owner->record_units_left > 0LL) {
         /* the witness: the tap's units are whole H.264 access units with their
          * start codes, so writing them out in order gives a raw stream ffmpeg
          * can be pointed at, which is how a screen nobody is looking at can
