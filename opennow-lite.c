@@ -31,6 +31,7 @@
  *   opennowlite: launch inspect reply=<n> decision=<n> scope=<n> status=<s>
  *   opennowlite: session create reply=<n> named=<0/1> phase=<s>
  *   opennowlite: poll attempt=<n> reply=<n> session=<0/1> status=<n> phase=<s> rtsps=<n>
+ *   opennowlite: polling the allocation up to <n> times     (the wait budget)
  *   opennowlite: session ready for <id>                    (launch)
  *   opennowlite: engine started for <id>                   (streamer up)
  *   opennowlite: encoded video unit 1 / encoded audio packet 1
@@ -40,10 +41,23 @@
  *                                                  1500 packets)
  *   opennowlite: video refused=N / audio refused=N                 (units the
  *                                                  appsrc would not take)
- *   opennowlite: pointer locked                            (mouse capture on)
+ *   opennowlite-input: pointer enter x= y= surface=         (the cursor reached
+ *                                                    this window)
+ *   opennowlite-input: pointer motion x= y=                (rate-limited)
+ *   opennowlite-input: pointer button=<evdev> state=<0/1>
+ *   opennowlite-input: pointer outside the window ignored  (the seat's cursor
+ *                                                   was over another window)
+ *   opennowlite-pilot: press N vk=0x.. at +Ns due=+Ns      (auto-pilot press)
+ *   opennowlite-pilot: jiggle N x= y= at +Ns due=+Ns       (auto-pilot keep move)
+ *   opennowlite: recording N s of picture into FILE        (--record on)
+ *   opennowlite: recorded bytes=N units_left=N             (every 50 s of picture)
+ *   opennowlite: record closed bytes=N                     (the witness file)
+ *   opennowlite-audio: witness frames=N bytes=N             (--debug-audio)
+ *   opennowlite-audio: witness closed frames=N             (the audio witness)
+ *   opennowlite-input: <kind> submit no=N at +Nms took N us (--debug-input)
  *   opennowlite-input: key code=<n> evdev=<n> state=<0/1>   (each key the seat sends)
  *   opennowlite-input: <kind> submit refused (<n>)          (first refused input call)
- *   opennowlite: stopping keys=N motions=N submits=N refused=N     (exit tally)
+ *   opennowlite: stopping keys=N motions=N submits=N refused=N skipped=N pilot=N
  */
 
 #define OPENNOWLITE_FFI_LIBRARY "/usr/lib/opennowlite/libopennowlite_streamer_ffi.so"
@@ -131,15 +145,26 @@ struct lite {
     struct wl_buffer *window_buffer;
     void *window_pixels;
     size_t window_bytes;
+    unsigned long pointer_skipped;
+    bool auto_pilot;
+    int pilot_times;
+    int pilot_gap;
+    bool pilot_click;
+    int pilot_point_x;
+    int pilot_point_y;
+    unsigned long pilot_presses;
+    unsigned long pilot_steps;
+    unsigned long pilot_jiggles;
+    struct timespec capture_started;
 };
 
 static struct lite app;
 
 static void seat_key(uint32_t key_code, bool pressed);
-static void seat_motion(double x, double y);
-static void seat_button(uint32_t button, uint32_t state);
-static void seat_wheel(int32_t value120);
-static void pointer_cursor_hide(void);
+static void seat_motion(struct lite *a, double x, double y);
+static void seat_button(struct lite *a, uint32_t button, uint32_t state);
+static void seat_wheel(struct lite *a, int32_t value120);
+static void pilot_send(struct lite *a);
 
 static long ms_since(const struct timespec *then)
 {
@@ -147,6 +172,38 @@ static long ms_since(const struct timespec *then)
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (now.tv_sec - then->tv_sec) * 1000L +
            (now.tv_nsec - then->tv_nsec) / 1000000L;
+}
+
+/* Temporary input measurement (--debug-input). What the seat was complained
+ * of is that a press of the pop-up's OK closed a few seconds later, and that
+ * delay splits into three parts: how long the client held the press before
+ * handing it over (the seat's event arrives and is submitted in the same
+ * listener call, so this is the weston keyboard focus, already separate in
+ * `opennowlite-input: key code=`), how long the streamer's own call took to
+ * accept it, and how long the picture took to change afterwards. The first
+ * two are measured here against the session clock, and the third one is read
+ * off the video witness against the same clock, which is why both numbers are
+ * printed in milliseconds since the capture started. The count is capped so
+ * the log stays readable over an hour. */
+static bool debug_input;
+static unsigned long input_timed;
+
+static void note_submit(const char *kind, const struct timespec *at)
+{
+    if (!debug_input)
+        return;
+    ++input_timed;
+    if (input_timed > 400u)
+        return;
+    struct timespec until;
+    clock_gettime(CLOCK_MONOTONIC, &until);
+    fprintf(stderr,
+            "opennowlite-input: %s submit no=%lu at +%ldms took %ldus\n",
+            kind, input_timed,
+            (at->tv_sec - app.capture_started.tv_sec) * 1000L +
+                (at->tv_nsec - app.capture_started.tv_nsec) / 1000000L,
+            (until.tv_sec - at->tv_sec) * 1000000L +
+                (until.tv_nsec - at->tv_nsec) / 1000L);
 }
 
 /* ---- xdg-shell ---- */
@@ -259,8 +316,11 @@ static void ptr_enter(void *data, struct wl_pointer *ptr, uint32_t serial,
     a->pointer_surface = surface;
     a->pointer_x = wl_fixed_to_double(sx);
     a->pointer_y = wl_fixed_to_double(sy);
-    fprintf(stderr, "opennowlite-input: pointer enter x=%.1f y=%.1f\n",
-            a->pointer_x, a->pointer_y);
+    fprintf(stderr, "opennowlite-input: pointer enter x=%.1f y=%.1f surface=%p\n",
+            a->pointer_x, a->pointer_y, (void *)surface);
+    /* OpenNOW publishes the entry point too, so a cursor that re-enters the
+     * window cannot leave the remote cursor on a stale position. */
+    seat_motion(a, a->pointer_x, a->pointer_y);
 }
 
 static void ptr_leave(void *data, struct wl_pointer *ptr, uint32_t serial, struct wl_surface *surface)
@@ -278,7 +338,7 @@ static void ptr_motion(void *data, struct wl_pointer *ptr, uint32_t time, wl_fix
     a->pointer_x = wl_fixed_to_double(sx);
     a->pointer_y = wl_fixed_to_double(sy);
     a->motions++;
-    seat_motion(a->pointer_x, a->pointer_y);
+    seat_motion(a, a->pointer_x, a->pointer_y);
     /* Rate-limit the log; the position itself is kept on every event. */
     if (ms_since(&a->last_motion) >= 100) {
         clock_gettime(CLOCK_MONOTONIC, &a->last_motion);
@@ -291,9 +351,10 @@ static void ptr_button(void *data, struct wl_pointer *ptr, uint32_t serial, uint
                        uint32_t button, uint32_t state)
 {
     (void)ptr; (void)serial; (void)time;
+    struct lite *a = data;
     fprintf(stderr, "opennowlite-input: pointer button=%u state=%u\n",
             button, state);
-    seat_button(button, state);
+    seat_button(a, button, state);
 }
 
 static void ptr_axis(void *data, struct wl_pointer *ptr, uint32_t time, uint32_t axis, wl_fixed_t value)
@@ -330,8 +391,7 @@ static void ptr_axis_value120(void *data, struct wl_pointer *ptr, uint32_t axis,
     /* a wheel step is reported as 120 units of a turn; only vertical turns
      * reach the game. */
     if (axis == 1)
-        seat_wheel(value120);
-    (void)a;
+        seat_wheel(a, value120);
 }
 
 static const struct wl_pointer_listener pointer_listener = {
@@ -1126,6 +1186,9 @@ static struct Streamer {
         bool pressed);
     OpenNowStreamerStatus (*relative)(
         const OpenNowStreamer *handle, int16_t delta_x, int16_t delta_y);
+    OpenNowStreamerStatus (*absolute)(
+        const OpenNowStreamer *handle, uint16_t x, uint16_t y,
+        uint16_t width, uint16_t height);
     OpenNowStreamerStatus (*button)(
         const OpenNowStreamer *handle, uint8_t button, bool pressed);
     OpenNowStreamerStatus (*wheel)(
@@ -1149,6 +1212,9 @@ typedef OpenNowStreamerStatus (*key_binding)(
     bool pressed);
 typedef OpenNowStreamerStatus (*relative_binding)(
     const OpenNowStreamer *handle, int16_t delta_x, int16_t delta_y);
+typedef OpenNowStreamerStatus (*absolute_binding)(
+    const OpenNowStreamer *handle, uint16_t x, uint16_t y,
+    uint16_t width, uint16_t height);
 typedef OpenNowStreamerStatus (*button_binding)(
     const OpenNowStreamer *handle, uint8_t button, bool pressed);
 typedef OpenNowStreamerStatus (*wheel_binding)(
@@ -1172,6 +1238,8 @@ static void streamer_load(void)
     streamer.key = (key_binding)dlsym(library, "opennow_streamer_submit_key");
     streamer.relative = (relative_binding)dlsym(
         library, "opennow_streamer_submit_mouse_relative");
+    streamer.absolute = (absolute_binding)dlsym(
+        library, "opennow_streamer_submit_mouse_absolute");
     streamer.button = (button_binding)dlsym(
         library, "opennow_streamer_submit_mouse_button");
     streamer.wheel = (wheel_binding)dlsym(
@@ -1179,7 +1247,7 @@ static void streamer_load(void)
     streamer.set_log = (log_binding)dlsym(
         library, "opennow_streamer_set_log_file");
     if (!streamer.create || !streamer.destroy || !streamer.send ||
-        !streamer.capture || !streamer.key || !streamer.relative ||
+        !streamer.capture || !streamer.key || !streamer.absolute ||
         !streamer.button || !streamer.wheel) {
         fprintf(stderr, "opennowlite: streamer library lacks an entry point\n");
         dlclose(library);
@@ -1366,6 +1434,18 @@ static int json_int_at(const char *doc, const char *key)
  * into its own pipeline, and the input is submitted through the streamer too.
  * The core holds an exclusive lock on its data directory, so OpenNOW and
  * OpenNOWLite cannot hold a seat at the same time - see the layer README. */
+
+/* How many times the allocation may be polled before the client gives up on
+ * it. r1.4 tried 60 times 2 s apart and every round that lost the launch ran
+ * out on the last try while the reply was still status=1 phase=preparing; the
+ * timed-out reply had already grown from 1846 bytes carrying an empty rtsps
+ * array (`rtsps=2`) to 2322 bytes carrying real endpoints (`rtsps=119`), so
+ * the ready answer was one poll away and only the wait was too short. The
+ * vendor's own shell leaves the same wait to the account's turn in the free-
+ * tier queue, so this is overridable: --poll-attempts=N at 2 s apart, 300
+ * (ten minutes) by default. */
+static int session_poll_attempts = 300;
+
 static bool session_open(const char *variant_id, const char *data_dir)
 {
     core_rpc = core_start(data_dir);
@@ -1530,7 +1610,18 @@ static bool session_open(const char *variant_id, const char *data_dir)
     bool prepared = false;
     int last_status = 0;
     char last_phase[32] = "";
-    for (int attempt = 0; attempt < 60 && !prepared; ++attempt) {
+    /* How long the allocation may stay preparing. The rounds at r1.4 that gave
+     * up after 60 tries never got a picture, and the timed-out poll was
+     * already holding the rtsps endpoints: the reply grew from 1846 bytes with
+     * rtsps=2 (an empty array) to 2322 bytes with rtsps=119, so the ready
+     * answer was one poll away and the wait was cut short, not refused. The
+     * vendor's own shell leaves this wait to the account's turn in the free-
+     * tier queue, which runs into minutes, so the default here is long and
+     * overridable: --poll-attempts=<n> at 2 s apart. */
+    int poll_limit = session_poll_attempts;
+    fprintf(stderr, "opennowlite: polling the allocation up to %d times\n",
+            poll_limit);
+    for (int attempt = 0; attempt < poll_limit && !prepared; ++attempt) {
         snprintf(params, sizeof(params), "{\"sessionId\":\"%s\"}", session_id);
         core_request(core_rpc, "lite-poll", "session.poll", params);
         frame = core_reply(core_rpc, "lite-poll", OPENNOWLITE_SESSION_TIMEOUT);
@@ -1625,6 +1716,13 @@ typedef struct Media {
     guint64 audio_units;
     guint64 video_refused;
     guint64 audio_refused;
+    FILE *record;
+    long long record_units_left;
+    guint64 recorded_bytes;
+    FILE *audio_dump;
+    long long audio_dump_left;
+    guint64 audio_dump_frames;
+    guint64 audio_dump_bytes;
 } Media;
 
 static Media media;
@@ -1717,6 +1815,24 @@ static void media_push_video(Media *owner, const OpenNowStreamerEncodedMedia
         return;
     }
     ++owner->video_units;
+    if (owner->record && owner->record_units_left > 0LL) {
+        /* the witness: the tap's units are whole H.264 access units with their
+         * start codes, so writing them out in order gives a raw stream ffmpeg
+         * can be pointed at, which is how a screen nobody is looking at can
+         * still be read. Bounded by seconds of picture, not by the session. */
+        if (fwrite(data, 1, length, owner->record) == length) {
+            owner->record_units_left -= 1LL;
+            owner->recorded_bytes += (guint64)length;
+            if (owner->record_units_left % 3000LL == 0LL)
+                fprintf(stderr, "opennowlite: recorded bytes=%llu units_left=%lld\n",
+                        (unsigned long long)owner->recorded_bytes,
+                        owner->record_units_left);
+        } else if (owner->recorded_bytes == 0u) {
+            fprintf(stderr, "opennowlite: record write failed: %s\n",
+                    strerror(errno));
+            owner->record_units_left = 0LL;
+        }
+    }
     if (owner->video_units == 1u) {
         fprintf(stderr, "opennowlite: encoded video unit 1\n");
     } else if (owner->video_units % 600u == 0u) {
@@ -1763,6 +1879,37 @@ static void media_push_audio(Media *owner,
         return;
     }
     ++owner->audio_units;
+    if (owner->audio_dump && owner->audio_dump_left > 0LL) {
+        /* the audio witness: the tap's Opus frames with a little-endian length
+         * in front of each, so the bytes an offline mux turns into an Ogg Opus
+         * file are exactly the bytes the seat's decoders were handed. Writing
+         * them here costs the session nothing: no second pipeline, no decode,
+         * a bounded count of frames rather than of seconds. */
+        guint32 le_len = (guint32)packet->data_len;
+        unsigned char hdr[4] = {
+            (unsigned char)(le_len & 0xffu),
+            (unsigned char)((le_len >> 8) & 0xffu),
+            (unsigned char)((le_len >> 16) & 0xffu),
+            (unsigned char)((le_len >> 24) & 0xffu),
+        };
+        if (fwrite(hdr, 1, sizeof(hdr), owner->audio_dump) == sizeof(hdr)
+            && fwrite(packet->data, 1, packet->data_len, owner->audio_dump)
+                == (size_t)packet->data_len) {
+            owner->audio_dump_left -= 1LL;
+            owner->audio_dump_frames += 1u;
+            owner->audio_dump_bytes += (guint64)packet->data_len;
+            if (owner->audio_dump_frames % 6000u == 0u)
+                fprintf(stderr,
+                        "opennowlite-audio: witness frames=%llu bytes=%llu at +%lds\n",
+                        (unsigned long long)owner->audio_dump_frames,
+                        (unsigned long long)owner->audio_dump_bytes,
+                        ms_since(&app.capture_started));
+        } else if (owner->audio_dump_frames == 0u) {
+            fprintf(stderr, "opennowlite-audio: witness write failed: %s\n",
+                    strerror(errno));
+            owner->audio_dump_left = 0LL;
+        }
+    }
     if (owner->audio_units == 1u) {
         fprintf(stderr,
                 "opennowlite: encoded audio packet 1 bytes=%zu channels=%u "
@@ -2094,6 +2241,7 @@ static bool engine_start(const char *variant_id)
         return false;
     }
     streamer.capture_active = true;
+    clock_gettime(CLOCK_MONOTONIC, &app.capture_started);
     fprintf(stderr, "opennowlite: engine started for %s\n", variant_id);
     return true;
 }
@@ -2114,53 +2262,92 @@ static void engine_stop(void)
 
 /* ---- pointer state and the seat's input adapters ---- */
 
-/* The seat's mouse is a physical pointer: weston moves an absolute cursor. For
- * a game GFN wants relative motion, so this client locks the pointer the way
- * OpenNOW does - the first left click locks and is not forwarded, so it cannot
- * also act inside the game - and afterwards turns weston's own motions into
- * relative deltas. Ctrl+Alt+Shift+Q releases the lock and closes the window. */
+/* The pointer is absolute, which is what OpenNOW itself does by default. The
+ * remote tells the client so: the streamer logs a cursor notification
+ * (`NVST cursor capture tx: command=0x0308 ... reason=cursor-notification`),
+ * and OpenNOW only switches to relative motion through its opt-in `relativeMouse`
+ * QML setting. The previous round of this client sent relative deltas, and the
+ * measured result on the seat was conclusive: 100 pointer buttons and 28 keys
+ * reached the FFI with no refusal, the seat's own arrow moved, and nothing in
+ * the stream ever did - the picture already carries its own remote cursor,
+ * whose place is a coordinate rather than a distance. Upstream's absolute path
+ * publishes a position on hover, on every button transition and on wheel, so
+ * the vendor's hit-testing and its clicks agree. */
+
+/* weston's wl_pointer reports the cursor inside the surface it hovers, so the
+ * numbers only mean something while that surface is this window. Their extent
+ * travels in the same packet as the coordinate, which is what the vendor
+ * normalises by, and this window keeps the video's aspect ratio, so window
+ * pixels need no rescaling. The FFI rejects a zero extent. */
 static struct Pointer {
-    bool locked;
     double last_x;
     double last_y;
-    int32_t dx;
-    int32_t dy;
     int32_t wheel;
 } pointer_state;
 
-static void pointer_submit(void)
+static void pointer_submit(struct lite *a, double x, double y)
 {
     if (!streamer.engine || !streamer.capture_active)
         return;
-    if (pointer_state.dx || pointer_state.dy) {
-        int16_t dx = (int16_t)pointer_state.dx;
-        int16_t dy = (int16_t)pointer_state.dy;
-        pointer_state.dx = 0;
-        pointer_state.dy = 0;
-        OpenNowStreamerStatus status =
-            streamer.relative(streamer.engine, dx, dy);
-        if (status == OPENNOW_STREAMER_OK) {
-            ++app.submits;
-        } else if (app.input_refused++ == 0u) {
-            fprintf(stderr, "opennowlite-input: motion submit refused (%d)\n",
-                    (int)status);
-        }
+    if (a->width < 1 || a->height < 1)
+        return;
+    uint32_t extent_x = (uint32_t)a->width;
+    uint32_t extent_y = (uint32_t)a->height;
+    if (x < 0.0)
+        x = 0.0;
+    if (y < 0.0)
+        y = 0.0;
+    if (x > (double)(extent_x - 1u))
+        x = (double)(extent_x - 1u);
+    if (y > (double)(extent_y - 1u))
+        y = (double)(extent_y - 1u);
+    /* u16 coordinates, so an oversized window cannot silently wrap around. */
+    if (extent_x > 65535u)
+        extent_x = 65535u;
+    if (extent_y > 65535u)
+        extent_y = 65535u;
+    struct timespec at;
+    bool timed = debug_input && input_timed < 400u;
+    if (timed)
+        clock_gettime(CLOCK_MONOTONIC, &at);
+    OpenNowStreamerStatus status =
+        streamer.absolute(streamer.engine,
+                          (uint16_t)(x + 0.5), (uint16_t)(y + 0.5),
+                          (uint16_t)extent_x, (uint16_t)extent_y);
+    if (timed)
+        note_submit("position", &at);
+    if (status == OPENNOW_STREAMER_OK) {
+        ++a->submits;
+    } else if (a->input_refused++ == 0u) {
+        fprintf(stderr, "opennowlite-input: position submit refused (%d)\n",
+                (int)status);
     }
-    if (pointer_state.wheel) {
-        /* weston reports a wheel step as 120 units of a turn; GFN steps by one,
-         * and scrolling away from the viewer is a positive step. */
-        int16_t steps = (int16_t)(pointer_state.wheel / 120);
-        pointer_state.wheel = 0;
-        if (steps) {
-            OpenNowStreamerStatus status =
-                streamer.wheel(streamer.engine, 0, -steps);
-            if (status == OPENNOW_STREAMER_OK) {
-                ++app.submits;
-            } else if (app.input_refused++ == 0u) {
-                fprintf(stderr, "opennowlite-input: wheel submit refused (%d)\n",
-                        (int)status);
-            }
-        }
+}
+
+static void pointer_scroll(struct lite *a)
+{
+    if (!streamer.engine || !streamer.capture_active)
+        return;
+    if (!pointer_state.wheel)
+        return;
+    /* A wheel step is 120 units of a turn on weston, on Windows (WHEEL_DELTA)
+     * and in GFN's packet: the vendor's Windows raw path forwards usButtonData
+     * straight through and its QML path passes Qt's angleDelta unchanged. The
+     * old round divided by 120 and negated the result, which made the scroll
+     * invisible in the stream. */
+    int32_t value = pointer_state.wheel;
+    pointer_state.wheel = 0;
+    if (value > 32767)
+        value = 32767;
+    if (value < -32767)
+        value = -32767;
+    OpenNowStreamerStatus status =
+        streamer.wheel(streamer.engine, 0, (int16_t)value);
+    if (status == OPENNOW_STREAMER_OK) {
+        ++a->submits;
+    } else if (a->input_refused++ == 0u) {
+        fprintf(stderr, "opennowlite-input: wheel submit refused (%d)\n",
+                (int)status);
     }
 }
 
@@ -2188,9 +2375,15 @@ static void seat_key(uint32_t key_code, bool pressed)
                     evdev);
         return;
     }
+    struct timespec at;
+    bool timed = debug_input && input_timed < 400u;
+    if (timed)
+        clock_gettime(CLOCK_MONOTONIC, &at);
     OpenNowStreamerStatus status = streamer.key(streamer.engine, virtual_key,
                                                 modifier_bits(app.modifier_mask),
                                                 pressed);
+    if (timed)
+        note_submit("key", &at);
     if (status == OPENNOW_STREAMER_OK) {
         ++app.submits;
     } else if (app.input_refused++ == 0u) {
@@ -2199,44 +2392,156 @@ static void seat_key(uint32_t key_code, bool pressed)
     }
 }
 
-/* The absolute cursor is tracked either way so the first locked motion cannot
- * jump the view by the whole distance the cursor had travelled unlocked. */
-static void seat_motion(double x, double y)
+/* The seat is a TV on a wall: when nobody is at a keyboard, the client can
+ * drive the cloud game's own notices. The measured shape of that chain is not
+ * one press a few seconds apart but one press per notice, ~135 s apart, and a
+ * clock that presses more than once per notice closes the host's own windows
+ * and leaves a bare desktop. The offsets this client arms by default are the
+ * measured ones: the consent notice answers a Return at +63 s and the splash's
+ * PRESS ENTER TO PLAY at +212 s. Keeping the host's ~14 minute idle timeout
+ * down with one Enter a minute was measured to fail - on the r1.3 round of Nov
+ * 7 the Escape armed for the SIGN UP notice opened Destiny 2's own `ARE YOU
+ * SURE? ... quit your current session and exit to desktop` over the character
+ * screen, what confirmed it put the session back on the Steam desktop, and the
+ * vendor then sent no media at all for the following ten minutes (`NVST rx-
+ * stats elapsed=320.1s ... frames=18298` was the last line) while the session
+ * stayed alive and kept answering input - a window holding one frame reads as
+ * no picture rather than as a slow one. So every event after the notice list
+ * is a pointer jiggle, which is activity the host counts and that no menu can
+ * act on. Return is VK 0x0d and Escape 0x1b from upstream's specials (the ad-
+ * hoc evdev table this client used to have had no Return at all, so Enter was
+ * silently dropped); one step of a press runs per pass of the main loop, so a
+ * hold lasts a second rather than zero time. The list is sized for a dense keep
+ * clock rather than the old once-a-minute one: a free-tier hour is 3600 s, so
+ * keeping the host's idle timer down every 5 s of that takes 720 events on top
+ * of the two notice answers, and a keep clock that thin (88 positions over the
+ * r1.4 round of Nov 7) was measured to lose the picture after 1720 s of media
+ * while the r1.2 round's 1734 positions held a full hour of it. */
+static long pilot_press_at[1200];
+static uint16_t pilot_press_key[1200];
+static unsigned long pilot_press_count;
+
+static void pilot_send(struct lite *a)
 {
-    if (pointer_state.locked) {
-        pointer_state.dx += (int32_t)(x - pointer_state.last_x);
-        pointer_state.dy += (int32_t)(y - pointer_state.last_y);
-        pointer_submit();
+    if (!a->auto_pilot || !streamer.engine || !streamer.capture_active)
+        return;
+    if (pilot_press_count == 0u)
+        return;
+    long elapsed = ms_since(&a->capture_started) / 1000L;
+    unsigned long press = a->pilot_steps / 2u;
+    if (press >= pilot_press_count) {
+        if (!a->pilot_click || a->pilot_steps > 2u * pilot_press_count + 2u)
+            return;
+        /* then, if asked for, one left click at a stated point: in absolute
+         * mode a click cannot land without a position, so the position goes
+         * first and the vendor keeps the order. */
+        unsigned long extra = a->pilot_steps - 2u * pilot_press_count;
+        long due = pilot_press_at[pilot_press_count - 1u] + 3L
+                 + (long)extra;
+        if (elapsed < due)
+            return;
+        if (extra == 0u) {
+            double point_x = (double)a->pilot_point_x;
+            double point_y = (double)a->pilot_point_y;
+            if (point_x <= 0.0)
+                point_x = (double)a->width / 2.0;
+            if (point_y <= 0.0)
+                point_y = (double)a->height / 2.0;
+            pointer_submit(a, point_x, point_y);
+        } else {
+            bool pressed = extra == 1u;
+            struct timespec click_at;
+            bool click_timed = debug_input && input_timed < 400u;
+            if (click_timed)
+                clock_gettime(CLOCK_MONOTONIC, &click_at);
+            OpenNowStreamerStatus status =
+                streamer.button(streamer.engine, 1u, pressed);
+            if (click_timed)
+                note_submit("click", &click_at);
+            if (status == OPENNOW_STREAMER_OK)
+                ++a->submits;
+            else if (a->input_refused++ == 0u)
+                fprintf(stderr, "opennowlite-pilot: click refused (%d)\n",
+                        (int)status);
+        }
+        ++a->pilot_steps;
+        return;
     }
+    bool pressed = (a->pilot_steps % 2u) == 0u;
+    long due = pilot_press_at[press] + (pressed ? 0L : 1L);
+    if (elapsed < due)
+        return;
+    if (pilot_press_key[press] == 0u) {
+        /* A keep event is a pointer move, not a key. Measured on the r1.3 round
+         * of Nov 7: the Escape the SIGN UP notice was answered with opened
+         * Destiny 2's own `ARE YOU SURE? ... quit your current session and exit
+         * to desktop` on the character screen, and what confirmed it sent the
+         * session back to the Steam desktop (the witness reads the store page at
+         * media +299 s), after which the vendor's media stopped altogether
+         * (`NVST rx-stats elapsed=320.1s ... frames=18298` was the last one)
+         * while the session stayed alive and kept answering input. A window that
+         * holds one frame for ten minutes reads as no picture at all, which is
+         * what it looked like on the TV. A pointer move counts as activity for
+         * the host's idle timer and lands on nothing that a menu acts on, so the
+         * keep clock moves the cursor a few pixels either side of the middle. */
+        if (pressed) {
+            double x = (double)(a->width / 2 + (press % 2u ? 40 : -40));
+            double y = (double)(a->height / 2);
+            pointer_submit(a, x, y);
+            ++a->pilot_jiggles;
+            fprintf(stderr, "opennowlite-pilot: jiggle %lu x=%.0f y=%.0f at +%lds due=+%lds\n",
+                    a->pilot_jiggles, x, y, elapsed, due);
+        }
+        ++a->pilot_steps;
+        return;
+    }
+    struct timespec at;
+    bool timed = debug_input && input_timed < 400u;
+    if (timed)
+        clock_gettime(CLOCK_MONOTONIC, &at);
+    OpenNowStreamerStatus status =
+        streamer.key(streamer.engine, pilot_press_key[press], 0u, pressed);
+    if (timed)
+        note_submit("press", &at);
+    if (status == OPENNOW_STREAMER_OK)
+        ++a->submits;
+    else if (a->input_refused++ == 0u)
+        fprintf(stderr, "opennowlite-pilot: press refused (%d)\n",
+                (int)status);
+    ++a->pilot_steps;
+    if (!pressed)
+        return;
+    ++a->pilot_presses;
+    fprintf(stderr, "opennowlite-pilot: press %lu vk=0x%02x at +%lds due=+%lds\n",
+            a->pilot_presses, (unsigned)pilot_press_key[press], elapsed, due);
+}
+
+/* Nothing is swallowed on the first click any more: absolute mode has no lock
+ * to negotiate, and the seat's own arrow stays visible because it is the thing
+ * the user is actually pointing with. */
+static void seat_motion(struct lite *a, double x, double y)
+{
     pointer_state.last_x = x;
     pointer_state.last_y = y;
+    if (a->pointer_surface != a->surface) {
+        /* The seat said the cursor is over some other window or the desktop,
+         * where its coordinates belong to that other surface. */
+        if (a->pointer_skipped++ == 0u)
+            fprintf(stderr, "opennowlite-input: pointer outside the window ignored\n");
+        return;
+    }
+    pointer_submit(a, x, y);
 }
 
 /* weston numbers buttons by their evdev code, not 1/2/3: a wl_pointer.button
  * event carries BTN_LEFT 0x110 (272), BTN_RIGHT 0x111 (273) and BTN_MIDDLE
- * 0x112 (274). Comparing the event against 1 meant the pointer never locked
- * and every press was dropped by the `!locked` guard - measured on the seat:
- * the log showed `pointer button=272 state=1` and never `pointer locked`, so
- * the game received no click at all. The streamer then wants X11 numbers, not
- * GFN's zero-based field: its own Windows raw-input path maps left to 1,
- * middle to 2 and right to 3, and its FFI rejects anything outside 1..=5 with
- * INVALID_CONFIG - measured: sending 0 for the left button produced
- * `button submit refused (2)` on the first click after the lock. */
-static void seat_button(uint32_t button, uint32_t state)
+ * 0x112 (274). The streamer then wants X11 numbers, not GFN's zero-based field:
+ * its own Windows raw-input path maps left to 1, middle to 2 and right to 3,
+ * and its FFI rejects anything outside 1..=5 with INVALID_CONFIG - measured on
+ * the seat: sending 0 for the left button produced `button submit refused (2)`. */
+static void seat_button(struct lite *a, uint32_t button, uint32_t state)
 {
     bool pressed = state == 1;
-    if (button == 272 && pressed && !pointer_state.locked) {
-        pointer_state.locked = true;
-        pointer_cursor_hide();
-        /* The click that locks the pointer is not forwarded, so locking cannot
-         * also fire in the game. */
-        fprintf(stderr, "opennowlite-input: pointer locked\n");
-        return;
-    }
-    if (!pointer_state.locked && pressed)
-        return;
-    if (!streamer.engine || !streamer.capture_active)
-        return;
     uint8_t mapped;
     switch (button) {
     case 272: mapped = 1u; break;   /* BTN_LEFT   -> X11/OpenNOW 1 */
@@ -2245,56 +2550,73 @@ static void seat_button(uint32_t button, uint32_t state)
     default:
         return;
     }
+    if (!streamer.engine || !streamer.capture_active)
+        return;
+    /* Upstream sends the position and then the button, on a release as well as
+     * a press, because no move event is guaranteed before a click and both
+     * have to keep their queue order. */
+    if (a->pointer_surface == a->surface)
+        pointer_submit(a, pointer_state.last_x, pointer_state.last_y);
+    struct timespec at;
+    bool timed = debug_input && input_timed < 400u;
+    if (timed)
+        clock_gettime(CLOCK_MONOTONIC, &at);
     OpenNowStreamerStatus status =
         streamer.button(streamer.engine, mapped, pressed);
+    if (timed)
+        note_submit("button", &at);
     if (status == OPENNOW_STREAMER_OK) {
-        ++app.submits;
-    } else if (app.input_refused++ == 0u) {
+        ++a->submits;
+    } else if (a->input_refused++ == 0u) {
         fprintf(stderr, "opennowlite-input: button submit refused (%d)\n",
                 (int)status);
     }
 }
 
-static void seat_wheel(int32_t value120)
+static void seat_wheel(struct lite *a, int32_t value120)
 {
     pointer_state.wheel += value120;
-    pointer_submit();
+    if (a->pointer_surface == a->surface)
+        pointer_submit(a, pointer_state.last_x, pointer_state.last_y);
+    pointer_scroll(a);
 }
 
-/* ---- the seat's cursor while the pointer is captured ---- */
-
-/* While the pointer is captured for the game, weston's own arrow is a second
- * pointer into the same scene, so it is hidden. The serial has to be the one
- * the seat last sent with wl_pointer.enter or weston ignores the request, and
- * a NULL surface is what hides the cursor. */
-static void pointer_cursor_hide(void)
+/* The notice answers are one list of seconds, each optionally followed by the
+ * key that notice names: `r` Return, `e` Escape. The SIGN UP notice the PLAY
+ * press opens reads `Esc Not Now` beside `Sign Me Up`, and the other option
+ * opens Bungie.net in the host's browser over the picture - measured with the
+ * Enter clock, which is why the default list ends in `e`. */
+static unsigned long pilot_list_parse(const char *list)
 {
-    if (!app.pointer)
-        return;
-    wl_pointer_set_cursor(app.pointer, app.enter_serial, NULL, 0, 0);
-    wl_display_flush(app.display);
-}
-
-/* No set_cursor of this program can put weston's own arrow back, so the way
- * out is the seat's: releasing tells the compositor this client is done with
- * the pointer interface, which is what makes it paint its default cursor
- * again, and the seat hands back a fresh proxy so the listeners below keep
- * working. Releasing already destroys the proxy, so nothing here destroys it
- * a second time. */
-static void pointer_cursor_show(void)
-{
-    if (!app.pointer || !app.seat)
-        return;
-    struct wl_pointer *pointer = app.pointer;
-    app.pointer = NULL;
-    wl_pointer_release(pointer);
-    app.pointer = wl_seat_get_pointer(app.seat);
-    if (!app.pointer)
-        return;
-    /* The seat drives the interface version itself, which is what the
-     * listener below expects, so the version is never claimed here. */
-    wl_pointer_add_listener(app.pointer, &pointer_listener, &app);
-    wl_display_flush(app.display);
+    unsigned long count = 0u;
+    while (*list && count < 1200u) {
+        long value = strtol(list, NULL, 10);
+        if (value < 0)
+            value = 0;
+        const char *comma = strchr(list, ',');
+        const char *stop = comma ? comma : list + strlen(list);
+        uint16_t key = 0x0du;
+        const char *colon = strchr(list, ':');
+        if (colon && colon < stop) {
+            switch (colon[1]) {
+            case 'e':
+                key = 0x1bu;
+                break;
+            case 'r':
+                key = 0x0du;
+                break;
+            default:
+                return 0u;
+            }
+        }
+        pilot_press_at[count] = value;
+        pilot_press_key[count] = key;
+        ++count;
+        if (!comma)
+            break;
+        list = comma + 1;
+    }
+    return count;
 }
 
 /* ---- main ---- */
@@ -2304,12 +2626,51 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s [--launch-app-id=ID] [--data-dir DIR] [--fullscreen]\n"
             "       [--width N] [--height N] [--pipeline DESC] [--test-pattern]\n"
+            "       [--auto-pilot] [--pilot-at=S] [--pilot-times=N] [--pilot-gap=S]\n"
+            "       [--pilot-click] [--pilot-point=WxH]\n"
+            "       [--record=FILE] [--record-seconds=S] [--poll-attempts=N]\n"
+            "       [--debug-input] [--debug-audio=FILE] [--debug-audio-seconds=S]\n"
             "  the default launch opens the seat's signed-in session and streams\n"
             "  the game into the app's own Wayland window; --test-pattern, or\n"
             "  --pipeline, plays a test pattern in that same window with no\n"
             "  session at all, which is how the window and the input path are\n"
             "  proven. --data-dir only points the shipped core at another copy\n"
-            "  of its data directory; by default it uses this seat's.\n",
+            "  of its data directory; by default it uses this seat's. The seat's\n"
+            "  pointer is sent as an absolute position inside the window.\n"
+            "  --poll-attempts=N caps how many times, 2 s apart, the allocated\n"
+            "  session is polled while the vendor still reports it preparing;\n"
+            "  300 (ten minutes) by default, since a free-tier queue wait was\n"
+            "  measured past the 120 s r1.4 spent before it gave up on a launch\n"
+            "  whose last poll had already started carrying rtsp endpoints.\n"
+            "  --debug-input stamps every input submit with its offset inside\n"
+            "  the session and the time the streamer's own call took, which is\n"
+            "  how the complaint that a press of a pop-up's OK closed seconds\n"
+            "  later splits: what the client held, what the accept cost, and\n"
+            "  what the picture answered on the same clock the witness runs on.\n"
+            "  --debug-audio also writes the first --debug-audio-seconds (60\n"
+            "  by default) of the stream's Opus frames into FILE as length-\n"
+            "  prefixed packets, which an offline mux turns into an Ogg Opus\n"
+            "  file: sound nobody is listening to can still be measured for\n"
+            "  level, pacing and gaps.\n"
+            "  With --auto-pilot the app drives the cloud game's own notices: it\n"
+            "  presses once per notice at --pilot-at, a comma list of seconds\n"
+            "  after the stream starts, each optionally followed by the key the\n"
+            "  notice names (`63:r,212:r` by default, r is Return and e Escape).\n"
+            "  A clock that presses twice per notice closes the host's own\n"
+            "  windows, and keys after the notice list are measured to fail:\n"
+            "  the Escape armed for the SIGN UP notice opened Destiny 2's own\n"
+            "  `ARE YOU SURE? ... quit your current session and exit to\n"
+            "  desktop`, and what confirmed it left the Steam desktop showing\n"
+            "  and the vendor sending no media at all. So every event after the\n"
+            "  list is a pointer jiggle one --pilot-gap seconds apart (60 s by\n"
+            "  default), --pilot-times of them (64 by default, which is past a\n"
+            "  free-tier hour from the first one at +272 s), activity the host\n"
+            "  counts for its ~14 minute idle timeout and that no menu can act\n"
+            "  on. With --pilot-click it also clicks once at --pilot-point, the\n"
+            "  middle by default, 3 s after the last event. --record also writes\n"
+            "  the first --record-seconds of picture into FILE as a raw H.264\n"
+            "  stream, which is how a screen nobody is looking at can still be\n"
+            "  checked afterwards.\n",
             argv0);
 }
 
@@ -2321,6 +2682,17 @@ int main(int argc, char **argv)
     int height = 1080;
     const char *variant_id = NULL;
     const char *data_dir = NULL;
+    bool auto_pilot = false;
+    bool pilot_at_given = false;
+    int pilot_times = 64;
+    int pilot_gap = 60;
+    bool pilot_click = false;
+    int pilot_point_x = 0;
+    int pilot_point_y = 0;
+    const char *record_path = NULL;
+    int record_seconds = 120;
+    const char *audio_dump_path = NULL;
+    int audio_dump_seconds = 60;
     const char *pipeline =
         "videotestsrc is-live=true ! videoconvert ! waylandsink name=sink "
         "sync=false";
@@ -2332,6 +2704,36 @@ int main(int argc, char **argv)
             data_dir = argv[++i];
         } else if (strcmp(argv[i], "--test-pattern") == 0) {
             test_pattern = true;
+        } else if (strcmp(argv[i], "--auto-pilot") == 0) {
+            /* no seat input: this client drives Steam's launch dialog itself */
+            auto_pilot = true;
+        } else if (strncmp(argv[i], "--pilot-at=", 11) == 0) {
+            pilot_press_count = pilot_list_parse(argv[i] + 11);
+            if (pilot_press_count == 0u) {
+                fprintf(stderr, "opennowlite: --pilot-at wants a comma list of seconds\n");
+                usage(argv[0]);
+                return 2;
+            }
+            pilot_at_given = true;
+        } else if (strncmp(argv[i], "--pilot-times=", 14) == 0) {
+            pilot_times = atoi(argv[i] + 14);
+        } else if (strncmp(argv[i], "--pilot-gap=", 12) == 0) {
+            pilot_gap = atoi(argv[i] + 12);
+        } else if (strcmp(argv[i], "--pilot-click") == 0) {
+            pilot_click = true;
+        } else if (strncmp(argv[i], "--record=", 9) == 0) {
+            /* the picture is also written out so a screen nobody is looking
+             * at can still be checked afterwards */
+            record_path = argv[i] + 9;
+        } else if (strncmp(argv[i], "--record-seconds=", 17) == 0) {
+            record_seconds = atoi(argv[i] + 17);
+        } else if (strncmp(argv[i], "--pilot-point=", 14) == 0) {
+            if (sscanf(argv[i] + 14, "%dx%d", &pilot_point_x,
+                       &pilot_point_y) != 2) {
+                fprintf(stderr, "opennowlite: --pilot-point wants WxH\n");
+                usage(argv[0]);
+                return 2;
+            }
         } else if (strcmp(argv[i], "--fullscreen") == 0) {
             fullscreen = true;
         } else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
@@ -2342,6 +2744,22 @@ int main(int argc, char **argv)
             /* only the test pattern has no session to feed the window */
             pipeline = argv[++i];
             test_pattern = true;
+        } else if (strncmp(argv[i], "--poll-attempts=", 16) == 0) {
+            session_poll_attempts = atoi(argv[i] + 16);
+            if (session_poll_attempts < 1) {
+                fprintf(stderr,
+                        "opennowlite: --poll-attempts wants a positive count\n");
+                usage(argv[0]);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--debug-input") == 0) {
+            debug_input = true;
+        } else if (strncmp(argv[i], "--debug-audio-seconds=", 22) == 0) {
+            audio_dump_seconds = atoi(argv[i] + 22);
+        } else if (strncmp(argv[i], "--debug-audio=", 14) == 0) {
+            /* the sound of the stream, kept so it can be analysed after the
+             * session instead of listened for during one */
+            audio_dump_path = argv[i] + 14;
         } else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -2360,8 +2778,26 @@ int main(int argc, char **argv)
         fprintf(stderr, "opennowlite: refusing a %dx%d window\n", width, height);
         return 2;
     }
-
-    signal(SIGINT, on_signal);
+    if (auto_pilot) {
+        if (!pilot_at_given)
+            pilot_press_count = pilot_list_parse("63:r,212:r");
+        for (int i = 0; i < pilot_times; i++) {
+            if (pilot_press_count >= 1200u)
+                break;
+            long last = pilot_press_at[pilot_press_count - 1u];
+            pilot_press_at[pilot_press_count] = last + (long)pilot_gap;
+            pilot_press_key[pilot_press_count] = 0u;
+            ++pilot_press_count;
+        }
+        for (unsigned long i = 1u; i < pilot_press_count; i++) {
+            if (pilot_press_at[i] <= pilot_press_at[i - 1u]) {
+                fprintf(stderr, "opennowlite: the pilot's seconds must rise in order\n");
+                return 2;
+            }
+        }
+        fprintf(stderr, "opennowlite: pilot armed with %lu presses, first at +%lds\n",
+                pilot_press_count, pilot_press_at[0u]);
+    }    signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     clock_gettime(CLOCK_MONOTONIC, &app.last_motion);
 
@@ -2386,6 +2822,41 @@ int main(int argc, char **argv)
     app.fullscreen = fullscreen;
     app.width = width;
     app.height = height;
+    app.auto_pilot = auto_pilot;
+    app.pilot_times = pilot_times;
+    app.pilot_gap = pilot_gap;
+    app.pilot_click = pilot_click;
+    app.pilot_point_x = pilot_point_x;
+    app.pilot_point_y = pilot_point_y;
+
+    if (record_path) {
+        if (record_seconds < 1 || record_seconds > 7200)
+            record_seconds = 120;
+        media.record = fopen(record_path, "wb");
+        if (!media.record) {
+            fprintf(stderr, "opennowlite: cannot open the record file %s: %s\n",
+                    record_path, strerror(errno));
+            return 1;
+        }
+        media.record_units_left = (long long)record_seconds * 60LL;
+        fprintf(stderr, "opennowlite: recording %d s of picture into %s\n",
+                record_seconds, record_path);
+    }
+
+    if (audio_dump_path) {
+        if (audio_dump_seconds < 1 || audio_dump_seconds > 600)
+            audio_dump_seconds = 60;
+        media.audio_dump = fopen(audio_dump_path, "wb");
+        if (!media.audio_dump) {
+            fprintf(stderr,
+                    "opennowlite-audio: cannot open the audio witness %s: %s\n",
+                    audio_dump_path, strerror(errno));
+            return 1;
+        }
+        media.audio_dump_left = (long long)audio_dump_seconds * 200LL;
+        fprintf(stderr, "opennowlite-audio: witnessing %d s of sound into %s\n",
+                audio_dump_seconds, audio_dump_path);
+    }
 
     if (!create_window(&app))
         return 1;
@@ -2410,6 +2881,7 @@ int main(int argc, char **argv)
             break;
         if (!drain_audio_bus(&media))
             media_audio_teardown(&media);
+        pilot_send(&app);
 
         wl_display_dispatch_pending(app.display);
         wl_display_flush(app.display);
@@ -2431,10 +2903,25 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "opennowlite: stopping keys=%lu motions=%lu submits=%lu refused=%lu\n",
-            app.keys, app.motions, app.submits, app.input_refused);
-    if (pointer_state.locked)
-        pointer_cursor_show();
+    fprintf(stderr, "opennowlite: stopping keys=%lu motions=%lu submits=%lu refused=%lu skipped=%lu pilot=%lu jiggle=%lu\n",
+            app.keys, app.motions, app.submits, app.input_refused,
+            app.pointer_skipped, app.pilot_presses, app.pilot_jiggles);
+    if (media.record) {
+        const int record_failed = fclose(media.record) != 0;
+        media.record = NULL;
+        fprintf(stderr, "opennowlite: record closed bytes=%llu%s\n",
+                (unsigned long long)media.recorded_bytes,
+                record_failed ? " (fclose failed)" : "");
+    }
+    if (media.audio_dump) {
+        const int dump_failed = fclose(media.audio_dump) != 0;
+        fprintf(stderr,
+                "opennowlite-audio: witness closed frames=%llu bytes=%llu%s\n",
+                (unsigned long long)media.audio_dump_frames,
+                (unsigned long long)media.audio_dump_bytes,
+                dump_failed ? " (fclose failed)" : "");
+        media.audio_dump = NULL;
+    }
     engine_stop();
     core_shutdown(core_rpc);
     if (media.audio) {
