@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""List the games in the signed-in OpenNOW library with their launch ids.
+
+OpenNOWLite launches one game by its variant id (--launch-app-id=ID). This
+helper asks the shipped opennow-core for the same catalog the OpenNOW window
+shows, so the ids can be read off without opening a game first.
+
+The core is a JSON-lines RPC server on stdin/stdout and holds an exclusive
+lock on its data directory, so it cannot run while OpenNOW or an OpenNOWLite
+session is already holding the seat.
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+
+CORE = "/usr/bin/opennow-core"
+SHELL_VERSION = "1.0.4-nightly.1515.1"
+PROTOCOL_VERSION = 6
+
+
+def walk(node, found):
+    """Collect every {title, launchAppId} pair anywhere in the reply."""
+    if isinstance(node, dict):
+        title = node.get("title")
+        launch = node.get("launchAppId")
+        if isinstance(title, str) and launch is not None:
+            found.append((title, str(launch)))
+        for value in node.values():
+            walk(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            walk(value, found)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="List games available to the seat's OpenNOW account.")
+    parser.add_argument("--data-dir", metavar="DIR",
+                        help="OpenNOW data directory (default: the seat's own)")
+    parser.add_argument("--json", action="store_true",
+                        help="print the core's raw reply instead of a table")
+    args = parser.parse_args()
+
+    argv = [CORE]
+    if args.data_dir:
+        argv += ["--data-dir", args.data_dir]
+    core = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            text=True, bufsize=1)
+
+    def call(rid, method, params=None):
+        request = {"type": "request", "id": rid, "method": method,
+                   "params": params or {}}
+        core.stdin.write(json.dumps(request) + "\n")
+        core.stdin.flush()
+        while True:
+            line = core.stdout.readline()
+            if not line:
+                sys.exit("opennowlite-games: the core closed the connection")
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if message.get("id") == rid and "ok" in message:
+                return message
+            # anything else is an event or an ack meant for someone else
+
+    try:
+        hello = call("hello", "core.hello", {
+            "protocolVersion": PROTOCOL_VERSION,
+            "shell": "opennowlite",
+            "shellVersion": SHELL_VERSION,
+        })
+        if not hello.get("ok"):
+            sys.exit("opennowlite-games: %s" % hello.get("error", "hello refused"))
+        reply = call("games", "catalog.library.list", {})
+        if not reply.get("ok"):
+            sys.exit("opennowlite-games: %s" % reply.get("error", "list refused"))
+        if args.json:
+            print(json.dumps(reply, indent=2))
+            return
+        games = []
+        walk(reply.get("result"), games)
+        seen = set()
+        for title, launch in games:
+            if launch in seen:
+                continue
+            seen.add(launch)
+            print("%-48s %s" % (title, launch))
+    finally:
+        core.stdin.close()
+        core.wait(timeout=10)
+
+
+if __name__ == "__main__":
+    main()
