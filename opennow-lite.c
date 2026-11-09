@@ -54,6 +54,9 @@
  *   opennowlite-input: pointer button=<evdev> state=<0/1>
  *   opennowlite-input: pointer outside the window ignored  (the seat's cursor
  *                                                   was over another window)
+ *   opennowlite-pilot: key N code=<n> at +Ns due=+Ns        (auto-pilot physical
+ *                                                    key: `:k` plus the evdev
+ *                                                    code, seat_key's own path)
  *   opennowlite-pilot: press N vk=0x.. at +Ns due=+Ns      (auto-pilot press)
  *   opennowlite-pilot: jiggle N x= y= at +Ns due=+Ns       (auto-pilot keep move)
  *   opennowlite: recording N s of picture into FILE        (--record on)
@@ -62,7 +65,9 @@
  *   opennowlite-audio: witness frames=N bytes=N             (--debug-audio)
  *   opennowlite-audio: witness closed frames=N             (the audio witness)
  *   opennowlite-input: <kind> submit no=N at +Nms took N us (--debug-input)
- *   opennowlite-input: key code=<n> evdev=<n> state=<0/1>   (each key the seat sends)
+ *   opennowlite-input: key code=<n> vk=0x.. state=<0/1>     (each key the seat sends,
+ *                                                    with the virtual key the map
+ *                                                    answered the code with)
  *   opennowlite-input: <kind> submit refused (<n>)          (first refused input call)
  *   opennowlite: stopping keys=N motions=N submits=N refused=N skipped=N pilot=N
  */
@@ -195,6 +200,7 @@ static long ms_since(const struct timespec *then)
  * the log stays readable over an hour. */
 static bool debug_input;
 static unsigned long input_timed;
+static unsigned long input_logged;
 
 /* The seat's desktop arrow. weston's desktop-shell client draws this arrow
  * above every window, and a seat complaint was that the picture then carries
@@ -299,9 +305,15 @@ static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial, uint32_t
     (void)kb; (void)serial; (void)time;
     struct lite *a = data;
     a->keys++;
-    /* Wayland key codes are evdev codes plus 8. */
-    fprintf(stderr, "opennowlite-input: key code=%u evdev=%u state=%u\n",
-            key, key >= 8 ? key - 8 : 0, state);
+    /* weston 13 puts the seat's raw evdev scancode in wl_keyboard.key: notify_key
+     * hands libinput_event_keyboard_get_key to grab->interface->key unchanged
+     * (libweston/input.c), and the only +8 near it is the one weston adds for its
+     * own xkb_state_update_key (libweston/input.c:2551), never for the wire.
+     * Measured on the seat on Nov 8: Escape arrived as 1, Return as 28, Space as
+     * 57, physical q as 16 and the F row as 59..68 with F11,F12 at 87,88, which
+     * is the numbering /usr/include/linux/input-event-codes.h gives for those
+     * keys. The virtual key this press becomes is logged by seat_key, which is
+     * also the path the pilot's `:k` acts take. */
     seat_key(key, state == 1);
 }
 
@@ -1326,8 +1338,14 @@ static void on_frame_available(void *unused)
 /* ---- key and pointer submission ---- */
 
 /* The seat's keyboard reports evdev codes; GFN takes Windows virtual keys. This
- * is opennow's own mapping, where the X11 keycode (evdev + 8) selects the
- * physical key. A code that is not in the table submits nothing, so an unknown
+ * is opennow's own mapping, indexed by the code the seat sent, which for this
+ * weston is the evdev scancode itself: the seat's F row arrives as KEY_F1 = 59
+ * .. KEY_F10 = 68, F11,F12 as 87,88, Up as KEY_UP = 103, Space as KEY_SPACE = 57
+ * and Escape as 1, all of them straight from /usr/include/linux/input-event-codes.h
+ * and all of them seen on the seat's own log. The X11 keycode (evdev + 8) that
+ * xkb and opennow's older code use appears nowhere on this wire, so taking 8 off
+ * here was the whole keymap defect, and it is gone from both this comment and the
+ * code. A code that is not in the table submits nothing, so an unknown
  * key can never press the wrong one in the game. */
 static uint16_t linux_virtual_key(uint32_t evdev)
 {
@@ -1348,7 +1366,13 @@ static uint16_t linux_virtual_key(uint32_t evdev)
         0x44, 0x46, 0x47, 0x48, 0x4a, 0x4b, 0x4c, 0xba,
         0xde, 0xc0, 0x00, 0xdc, 0x5a, 0x58, 0x43, 0x56,
         0x42, 0x4e, 0x4d, 0xbc, 0xbe, 0xbf, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* 0x20 is Space, which sits at KEY_SPACE = 57 (input-event-codes.h) in
+         * this row. Upstream's table has a hole there, so the seat's Space
+         * pressed no virtual key at all: measured on the seat on Nov 8, Space
+         * arrived as 57 and, with the map fed the code minus 8, it reached
+         * index 49, which is where 0x4e (`N`) sits, so the jump key typed n and
+         * the game never left the ground. */
+        0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe2, 0x00,
@@ -2737,27 +2761,51 @@ static void pointer_scroll(struct lite *a)
     }
 }
 
-static bool quit_key(uint32_t evdev, uint32_t modifier_mask)
+static bool quit_key(uint32_t code, uint32_t modifier_mask)
 {
-    /* Ctrl+Alt+Shift: xkb bits 0 (shift), 2 (control) and 3 (alt). The old
+    /* The shortcut is the seat's own physical Ctrl+Alt+Shift+o, whose key is
+     * KEY_O = 24 (input-event-codes.h). The old test asked for 16 because it was
+     * fed the same evdev - 8 the map below was carrying, and 16 is what 24 - 8
+     * came out as; with the subtraction gone this is the physical key again.
+     * Ctrl+Alt+Shift: xkb bits 0 (shift), 2 (control) and 3 (alt). The old
      * mask 0x7 asked for shift, caps-lock and control, so the exit shortcut
      * could never fire. */
-    return evdev == 16 && (modifier_mask & 0x0du) == 0x0du;
+    return code == 24u && (modifier_mask & 0x0du) == 0x0du;
 }
 
-static void seat_key(uint32_t key_code, bool pressed)
+static void seat_key(uint32_t code, bool pressed)
 {
-    uint32_t evdev = key_code >= 8 ? key_code - 8 : 0;
+    /* Nothing is taken off the seat's code here. This used to be
+     * `code >= 8 ? code - 8 : 0`, and that was the whole keymap defect: every
+     * key the game received was one key to the left of the one the seat had
+     * pressed. The seat's own play read it: the physical q came in as 16 and
+     * reached the map at 8, where 0x37 (`7`) sits, so q typed 7; Space came in
+     * as 57 and reached it at 49, where 0x4e (`N`) sits, so Space typed n;
+     * Escape at 1 fell to the guard and sent nothing at all, which is why the
+     * ESC the character screen asks for never closed anything; and F11 at 87
+     * fell through the F range into the keypad block at 79, which is KEY_KP1,
+     * so F11 typed 1. With the subtraction gone the physical key, the code the
+     * seat sent and the map's index are the same thing, and the map, the F
+     * ranges and the specials and keypad blocks in it are already spelled in
+     * these codes (input-event-codes.h: KEY_F1 = 59 .. KEY_F10 = 68, KEY_F11
+     * = 87, KEY_KP7 = 71 .. KEY_KP0 = 82, KEY_KPSLASH = 98, KEY_LEFTALT = 56,
+     * KEY_O = 24), which is the tell that named the one line to change. */
+    uint32_t evdev = code;
     if (quit_key(evdev, app.modifier_mask)) {
         running = 0;
         return;
     }
+    uint16_t virtual_key = linux_virtual_key(evdev);
+    if (debug_input && input_logged < 4000u) {
+        ++input_logged;
+        fprintf(stderr, "opennowlite-input: key code=%u vk=0x%04x state=%u\n",
+                evdev, (unsigned)virtual_key, pressed ? 1u : 0u);
+    }
     if (!streamer.engine || !streamer.capture_active)
         return;
-    uint16_t virtual_key = linux_virtual_key(evdev);
     if (!virtual_key) {
         if (app.input_refused++ == 0u)
-            fprintf(stderr, "opennowlite-input: no virtual key for evdev=%u\n",
+            fprintf(stderr, "opennowlite-input: no virtual key for code=%u\n",
                     evdev);
         return;
     }
@@ -2879,6 +2927,28 @@ static void pilot_send(struct lite *a)
                     a->pilot_jiggles, x, y, elapsed, due);
         }
         ++a->pilot_steps;
+        return;
+    }
+    if (pilot_press_key[press] >= 0x1000u) {
+        /* a physical press rather than a virtual key: this is the function the
+         * seat's own keyboard enters at, so the round shows the code the seat
+         * was asked for and the virtual key the map answered with, which is how
+         * an unattended round can prove the seat's code to Windows virtual key
+         * map without anyone at the seat. */
+        uint32_t code = pilot_press_key[press] & 0x0fffu;
+        struct timespec at;
+        bool timed = debug_input && input_timed < 400u;
+        if (timed)
+            clock_gettime(CLOCK_MONOTONIC, &at);
+        seat_key(code, pressed);
+        if (timed)
+            note_submit("key", &at);
+        ++a->pilot_steps;
+        if (!pressed)
+            return;
+        ++a->pilot_presses;
+        fprintf(stderr, "opennowlite-pilot: key %lu code=%u at +%lds due=+%lds\n",
+                a->pilot_presses, code, elapsed, due);
         return;
     }
     if (pilot_press_key[press] == 0x100u) {
@@ -3049,6 +3119,16 @@ static unsigned long pilot_list_parse(const char *list)
             case 'c':
                 key = 0x100u;
                 break;
+            /* `:k` plus a number is a physical key rather than a virtual one:
+             * pilot_send hands the code to seat_key, the function the seat's
+             * own keyboard enters at, so an unattended round can prove what
+             * code the map was asked and what virtual key it answered without
+             * anyone sitting at the seat. The number is the evdev scancode, so
+             * `:k16` is the seat's q and `:k57` its Space. */
+            case 'k':
+                key = (uint16_t)(0x1000u
+                                 | (uint16_t)strtol(colon + 2, NULL, 10));
+                break;
             default:
                 return 0u;
             }
@@ -3109,7 +3189,13 @@ static void usage(const char *argv0)
             "  after the stream starts, each optionally followed by the key the\n"
             "  notice names (`63:r,212:r` by default, r is Return, e Escape,\n"
             "  s Space and c a left click at --pilot-point; an entry with no\n"
-            "  suffix is a pointer move).\n"
+            "  suffix is a pointer move). `:k` plus a number presses that\n"
+            "  physical key instead of a virtual one: the code goes through\n"
+            "  seat_key, the function the seat's own keyboard enters at, so an\n"
+            "  unattended round can show the code the seat was asked for and\n"
+            "  the Windows virtual key the map answered with. The number is\n"
+            "  the evdev scancode, so `:k16` is the seat's q, `:k57` its Space\n"
+            "  and `:k103` its Up arrow.\n"
             "  A clock that presses twice per notice closes the host's own\n"
             "  windows, and keys after the notice list are measured to fail:\n"
             "  the Escape armed for the SIGN UP notice opened Destiny 2's own\n"
