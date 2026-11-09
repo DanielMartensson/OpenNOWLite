@@ -25,6 +25,27 @@
  * inside the game, which leaves exactly one pointer; --show-cursor keeps the
  * arrow for a screen that is meant to show both.
  *
+ * The seat's pointer travels into the game as a distance (NVST command 7, the
+ * streamer's MouseMove, which is the game's own mouse-look input) by default,
+ * because a place was measured to bound the camera at one half-turn: the game's
+ * cursor was placed where the seat's cursor is, and weston holds that cursor at
+ * the window's own edge, so one sweep of a hand was one half-turn of the camera
+ * and the sweep back undid all of it rather than adding to it. The distance is
+ * taken from the relative-pointer protocol, whose deltas weston does not clamp
+ * to the surface, so the edge of the window is not the edge of the turn; while
+ * relative mode is on the pointer is also locked to the surface (oneshot, so it
+ * is released when the pointer leaves) and the deltas keep arriving. A 360 deg
+ * turn is therefore possible without lifting a hand, and without a relative
+ * pointer the client falls back to the change of the seat's place. --mouse-
+ * absolute puts the old place back on the wire,
+ * which is what a screen that is meant to be hit-tested at a stated point wants.
+ * --mouse-look=<percent> (25..400, 100 by default) says how much of a turn one
+ * swept pixel is worth: the library's own OPENNOW_MOUSE_SENSITIVITY and
+ * OPENNOW_MOUSE_ACCELERATION are read from the process environment by a once-
+ * evaluated lock, so they cannot be set from inside a client that was execed
+ * bare, and this is the same scaling done where it can be set, with a distance
+ * too big for one int16 split into whole MouseMove packets rather than clipped.
+ *
  * Markers (grep -a):
  *   opennowlite: window ready
  *   opennowlite: pipeline playing                          (test pattern)
@@ -51,6 +72,11 @@
  *   opennowlite-input: pointer enter x= y= surface=         (the cursor reached
  *                                                    this window)
  *   opennowlite-input: pointer motion x= y=                (rate-limited)
+ *   opennowlite-input: relative pointer available           (the unclamped
+ *                                                    distance path is in use)
+ *   opennowlite-input: relative motion dx= dy=             (rate-limited)
+ *   opennowlite-input: pointer lock requested              (constraint asked for)
+ *   opennowlite-input: pointer locked to the window        (constraint active)
  *   opennowlite-input: pointer button=<evdev> state=<0/1>
  *   opennowlite-input: pointer outside the window ignored  (the seat's cursor
  *                                                   was over another window)
@@ -59,6 +85,8 @@
  *                                                    code, seat_key's own path)
  *   opennowlite-pilot: press N vk=0x.. at +Ns due=+Ns      (auto-pilot press)
  *   opennowlite-pilot: jiggle N x= y= at +Ns due=+Ns       (auto-pilot keep move)
+ *   opennowlite-pilot: move N dx= dy= at +Ns due=+Ns      (auto-pilot `:m` act,
+ *                                                   one MouseMove delta each)
  *   opennowlite: recording N s of picture into FILE        (--record on)
  *   opennowlite: recorded bytes=N units_left=N             (every 50 s of picture)
  *   opennowlite: record closed bytes=N                     (the witness file)
@@ -109,6 +137,8 @@
 #include <gst/app/gstappsrc.h>
 
 #include "xdg-shell-client-protocol.h"
+#include "pointer-constraints-unstable-v1-client-protocol.h"
+#include "relative-pointer-unstable-v1-client-protocol.h"
 
 /* The streamer's types come from the header the library was generated from, so
  * the config layout the app fills and the layout the Rust side validates cannot
@@ -135,6 +165,19 @@ struct lite {
     struct wl_seat *seat;
     struct wl_keyboard *keyboard;
     struct wl_pointer *pointer;
+    /* The seat's pointer only ever carries a place, and weston holds that place
+     * inside this window. The relative-pointer protocol carries the distance
+     * the hand actually travelled, unclamped, which is what lets the camera
+     * turn past the window's own edge; the pointer-constraints protocol keeps
+     * the seat's pointer on this surface so that distance keeps arriving. */
+    struct zwp_relative_pointer_manager_v1 *relative_pointer_manager;
+    struct zwp_relative_pointer_v1 *relative_pointer;
+    struct zwp_pointer_constraints_v1 *pointer_constraints;
+    struct zwp_locked_pointer_v1 *locked_pointer;
+    bool pointer_lock;
+    double relative_residue_x;
+    double relative_residue_y;
+    unsigned long relative_motions;
     struct wl_surface *surface;
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *toplevel;
@@ -144,6 +187,7 @@ struct lite {
     uint32_t enter_serial;
     bool configured;
     bool fullscreen;
+    bool mouse_relative;
     int width;
     int height;
     GstElement *pipeline;
@@ -168,6 +212,7 @@ struct lite {
     unsigned long pilot_presses;
     unsigned long pilot_steps;
     unsigned long pilot_jiggles;
+    unsigned long pilot_moves;
     struct timespec capture_started;
 };
 
@@ -177,7 +222,31 @@ static void seat_key(uint32_t key_code, bool pressed);
 static void seat_motion(struct lite *a, double x, double y);
 static void seat_button(struct lite *a, uint32_t button, uint32_t state);
 static void seat_wheel(struct lite *a, int32_t value120);
+static void pointer_delta(struct lite *a, int dx, int dy);
+static void ensure_pointer_lock(struct lite *a);
+static void release_pointer_lock(struct lite *a);
 static void pilot_send(struct lite *a);
+
+/* The pointer's own state. weston's wl_pointer reports the cursor inside the
+ * surface it hovers, so the numbers only mean something while that surface is
+ * this window. Their extent travels in the same packet as the coordinate, which
+ * is what the vendor normalises by, and this window keeps the video's aspect
+ * ratio, so window pixels need no rescaling. The FFI rejects a zero extent.
+ * In relative mode the distance normally comes from the relative pointer; this
+ * place is then only the reference the first absolute placement is taken from
+ * and the fallback when the compositor has no relative pointer. */
+static struct Pointer {
+    double last_x;
+    double last_y;
+    int32_t wheel;
+    /* relative mode's own reference: the place the client last put the game's
+     * cursor at. A distance is measured against that, not against the seat's
+     * cursor, so a cursor that re-enters the window or one that is held against
+     * an edge cannot move the camera by a distance the user never swept. */
+    bool placed;
+    int placed_x;
+    int placed_y;
+} pointer_state;
 
 static long ms_since(const struct timespec *then)
 {
@@ -359,8 +428,17 @@ static void ptr_enter(void *data, struct wl_pointer *ptr, uint32_t serial,
     a->pointer_surface = surface;
     a->pointer_x = wl_fixed_to_double(sx);
     a->pointer_y = wl_fixed_to_double(sy);
+    a->relative_residue_x = 0.0;
+    a->relative_residue_y = 0.0;
     fprintf(stderr, "opennowlite-input: pointer enter x=%.1f y=%.1f surface=%p\n",
             a->pointer_x, a->pointer_y, (void *)surface);
+    ensure_pointer_lock(a);
+    /* A re-enter is a fresh placement, not a distance: the relative pointer
+     * starts a new stream of deltas and the game's cursor is put back where
+     * the seat's cursor entered, rather than jumped by the gap between the
+     * two entries. */
+    if (a->mouse_relative && a->relative_pointer)
+        pointer_state.placed = false;
     /* OpenNOW publishes the entry point too, so a cursor that re-enters the
      * window cannot leave the remote cursor on a stale position. */
     seat_motion(a, a->pointer_x, a->pointer_y);
@@ -370,6 +448,9 @@ static void ptr_leave(void *data, struct wl_pointer *ptr, uint32_t serial, struc
 {
     (void)ptr; (void)serial; (void)surface;
     struct lite *a = data;
+    release_pointer_lock(a);
+    a->relative_residue_x = 0.0;
+    a->relative_residue_y = 0.0;
     a->pointer_surface = NULL;
     fprintf(stderr, "opennowlite-input: pointer leave\n");
 }
@@ -381,7 +462,11 @@ static void ptr_motion(void *data, struct wl_pointer *ptr, uint32_t time, wl_fix
     a->pointer_x = wl_fixed_to_double(sx);
     a->pointer_y = wl_fixed_to_double(sy);
     a->motions++;
-    seat_motion(a, a->pointer_x, a->pointer_y);
+    /* With a relative pointer the distance comes from relative_motion, which
+     * weston does not clamp to this surface. Deriving one from this place as
+     * well would count every move twice and put the edge back. */
+    if (!(a->mouse_relative && a->relative_pointer))
+        seat_motion(a, a->pointer_x, a->pointer_y);
     /* Rate-limit the log; the position itself is kept on every event. */
     if (ms_since(&a->last_motion) >= 100) {
         clock_gettime(CLOCK_MONOTONIC, &a->last_motion);
@@ -450,6 +535,115 @@ static const struct wl_pointer_listener pointer_listener = {
     .axis_value120 = ptr_axis_value120,
 };
 
+/* ---- relative pointer ---- */
+
+/* The distance the hand travelled, from weston's own motion event before it is
+ * clamped to the surface. This is the whole fix for the half-turn: the seat's
+ * wl_pointer reports a place, and a place stops at the window's edge, so a
+ * sweep that reached the edge and kept going produced no further motion event
+ * and the camera stopped with it. A relative pointer reports the delta itself,
+ * unclamped, so a hand that keeps moving keeps turning the camera past 180 deg
+ * and past a full circle without being lifted. */
+static void relative_motion(void *data, struct zwp_relative_pointer_v1 *rp,
+                            uint32_t utime_hi, uint32_t utime_lo,
+                            wl_fixed_t dx, wl_fixed_t dy,
+                            wl_fixed_t dx_unaccel, wl_fixed_t dy_unaccel)
+{
+    (void)rp; (void)utime_hi; (void)utime_lo;
+    (void)dx_unaccel; (void)dy_unaccel;
+    struct lite *a = data;
+    if (!a->mouse_relative)
+        return;
+    /* A slow sweep is many sub-pixel events; dropping each fractional part
+     * would lose the turn entirely, so the remainder is carried forward. */
+    a->relative_residue_x += wl_fixed_to_double(dx);
+    a->relative_residue_y += wl_fixed_to_double(dy);
+    int step_x = (int)a->relative_residue_x;
+    int step_y = (int)a->relative_residue_y;
+    a->relative_residue_x -= step_x;
+    a->relative_residue_y -= step_y;
+    ++a->relative_motions;
+    if (step_x || step_y)
+        pointer_delta(a, step_x, step_y);
+    if (debug_input && ms_since(&a->last_motion) >= 100) {
+        clock_gettime(CLOCK_MONOTONIC, &a->last_motion);
+        fprintf(stderr, "opennowlite-input: relative motion dx=%.2f dy=%.2f\n",
+                wl_fixed_to_double(dx), wl_fixed_to_double(dy));
+    }
+}
+
+static const struct zwp_relative_pointer_v1_listener relative_pointer_listener = {
+    .relative_motion = relative_motion,
+};
+
+static void ensure_relative_pointer(struct lite *a)
+{
+    if (a->relative_pointer || !a->pointer || !a->relative_pointer_manager)
+        return;
+    a->relative_pointer =
+        zwp_relative_pointer_manager_v1_get_relative_pointer(
+            a->relative_pointer_manager, a->pointer);
+    if (a->relative_pointer) {
+        zwp_relative_pointer_v1_add_listener(a->relative_pointer,
+                                             &relative_pointer_listener, a);
+        fprintf(stderr, "opennowlite-input: relative pointer available\n");
+    }
+}
+
+/* ---- pointer lock ---- */
+
+static void locked_pointer_locked(void *data, struct zwp_locked_pointer_v1 *lp)
+{
+    (void)data; (void)lp;
+    fprintf(stderr, "opennowlite-input: pointer locked to the window\n");
+}
+
+static void locked_pointer_unlocked(void *data, struct zwp_locked_pointer_v1 *lp)
+{
+    struct lite *a = data;
+    (void)lp;
+    /* weston removed the constraint (the window lost focus, or the seat
+     * changed); drop the handle so the next enter asks for a fresh one. */
+    if (a->locked_pointer) {
+        zwp_locked_pointer_v1_destroy(a->locked_pointer);
+        a->locked_pointer = NULL;
+    }
+}
+
+static const struct zwp_locked_pointer_v1_listener locked_pointer_listener = {
+    .locked = locked_pointer_locked,
+    .unlocked = locked_pointer_unlocked,
+};
+
+static void release_pointer_lock(struct lite *a)
+{
+    if (a->locked_pointer) {
+        zwp_locked_pointer_v1_destroy(a->locked_pointer);
+        a->locked_pointer = NULL;
+    }
+}
+
+static void ensure_pointer_lock(struct lite *a)
+{
+    if (!a->mouse_relative || !a->pointer_lock)
+        return;
+    if (a->locked_pointer || !a->pointer_constraints || !a->pointer)
+        return;
+    if (!a->pointer_surface || a->pointer_surface != a->surface)
+        return;
+    /* ONESHOT rather than PERSISTENT: weston releases the constraint as soon
+     * as the pointer leaves the surface, which is what switching windows does,
+     * so a lock can never trap the seat's pointer on this window. */
+    a->locked_pointer = zwp_pointer_constraints_v1_lock_pointer(
+        a->pointer_constraints, a->surface, a->pointer, NULL,
+        ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT);
+    if (a->locked_pointer) {
+        zwp_locked_pointer_v1_add_listener(a->locked_pointer,
+                                           &locked_pointer_listener, a);
+        fprintf(stderr, "opennowlite-input: pointer lock requested\n");
+    }
+}
+
 /* ---- seat ---- */
 
 static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
@@ -467,7 +661,13 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
         a->pointer = wl_seat_get_pointer(seat);
         wl_pointer_add_listener(a->pointer, &pointer_listener, a);
         fprintf(stderr, "opennowlite: seat has a pointer\n");
+        ensure_relative_pointer(a);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && a->pointer) {
+        release_pointer_lock(a);
+        if (a->relative_pointer) {
+            zwp_relative_pointer_v1_destroy(a->relative_pointer);
+            a->relative_pointer = NULL;
+        }
         wl_pointer_destroy(a->pointer);
         a->pointer = NULL;
     }
@@ -503,6 +703,17 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         a->seat = wl_registry_bind(registry, name, &wl_seat_interface,
                                    version < 5 ? version : 5);
         wl_seat_add_listener(a->seat, &seat_listener, a);
+    } else if (strcmp(interface,
+                      zwp_relative_pointer_manager_v1_interface.name) == 0) {
+        a->relative_pointer_manager =
+            wl_registry_bind(registry, name,
+                             &zwp_relative_pointer_manager_v1_interface, 1);
+        ensure_relative_pointer(a);
+    } else if (strcmp(interface,
+                      zwp_pointer_constraints_v1_interface.name) == 0) {
+        a->pointer_constraints =
+            wl_registry_bind(registry, name,
+                             &zwp_pointer_constraints_v1_interface, 1);
     }
 }
 
@@ -1291,7 +1502,7 @@ static void streamer_load(void)
         library, "opennow_streamer_set_log_file");
     if (!streamer.create || !streamer.destroy || !streamer.send ||
         !streamer.capture || !streamer.key || !streamer.absolute ||
-        !streamer.button || !streamer.wheel) {
+        !streamer.relative || !streamer.button || !streamer.wheel) {
         fprintf(stderr, "opennowlite: streamer library lacks an entry point\n");
         dlclose(library);
         return;
@@ -2643,9 +2854,12 @@ static bool engine_start(const char *variant_id)
 
     /* Capture is this program's: pointer lock is done here over the seat's own
      * wl_pointer, so the streamer must not take over the raw X11 path, which
-     * the seat has no use for. */
+     * the seat has no use for. That path needs a nonzero window handle, so it
+     * stays off whether the pointer goes as a place or as a distance; the mode
+     * is only ever reported here so the library knows what it is being fed. */
     bool raw_input = false;
-    status = streamer.capture(streamer.engine, true, false, 0u, &raw_input);
+    status = streamer.capture(streamer.engine, true, app.mouse_relative, 0u,
+                              &raw_input);
     if (status != OPENNOW_STREAMER_OK) {
         fprintf(stderr, "opennowlite: capture refused (%d)\n", (int)status);
         return false;
@@ -2672,28 +2886,29 @@ static void engine_stop(void)
 
 /* ---- pointer state and the seat's input adapters ---- */
 
-/* The pointer is absolute, which is what OpenNOW itself does by default. The
- * remote tells the client so: the streamer logs a cursor notification
- * (`NVST cursor capture tx: command=0x0308 ... reason=cursor-notification`),
- * and OpenNOW only switches to relative motion through its opt-in `relativeMouse`
- * QML setting. The previous round of this client sent relative deltas, and the
- * measured result on the seat was conclusive: 100 pointer buttons and 28 keys
- * reached the FFI with no refusal, the seat's own arrow moved, and nothing in
- * the stream ever did - the picture already carries its own remote cursor,
- * whose place is a coordinate rather than a distance. Upstream's absolute path
- * publishes a position on hover, on every button transition and on wheel, so
- * the vendor's hit-testing and its clicks agree. */
-
-/* weston's wl_pointer reports the cursor inside the surface it hovers, so the
- * numbers only mean something while that surface is this window. Their extent
- * travels in the same packet as the coordinate, which is what the vendor
- * normalises by, and this window keeps the video's aspect ratio, so window
- * pixels need no rescaling. The FFI rejects a zero extent. */
-static struct Pointer {
-    double last_x;
-    double last_y;
-    int32_t wheel;
-} pointer_state;
+/* The pointer travels as a distance, which is what the game's own mouse-look
+ * input is. The remote tells the client which mode it is in: the streamer logs
+ * a cursor notification (`NVST cursor capture tx: command=0x0308 ...
+ * reason=cursor-notification`), and OpenNOW switches to relative motion through
+ * its opt-in `relativeMouse` QML setting. An earlier round of this client sent
+ * relative deltas while the game was still in cursor mode and the measured
+ * result was conclusive: 100 pointer buttons and 28 keys reached the FFI with
+ * no refusal, the seat's own arrow moved, and nothing in the stream ever did -
+ * the picture already carries its own remote cursor, whose place is a
+ * coordinate rather than a distance. Upstream's absolute path publishes a
+ * position on hover, on every button transition and on wheel, so the vendor's
+ * hit-testing and its clicks agree.
+ *
+ * What was measured after that is that a place is also a limit: a seat cursor
+ * that has reached a window edge has nowhere left to take that place, so one
+ * sweep of a hand answered as one half-turn of the camera and the sweep back
+ * undid it. A distance has no edge, and the relative-pointer protocol carries
+ * the hand's own unclamped delta, so the camera turns all the way round; the
+ * streamer's MouseMove (NVST command 7) is that distance, and the library
+ * scales it by OPENNOW_MOUSE_SENSITIVITY and OPENNOW_MOUSE_ACCELERATION. A
+ * click then keeps the button on whatever cursor the game already has rather
+ * than republishing a place.
+ */
 
 static void pointer_submit(struct lite *a, double x, double y)
 {
@@ -2732,6 +2947,103 @@ static void pointer_submit(struct lite *a, double x, double y)
         fprintf(stderr, "opennowlite-input: position submit refused (%d)\n",
                 (int)status);
     }
+}
+
+/* One MouseMove (NVST command 7): a distance rather than a place, so nothing in
+ * this client can be clamped to a window edge and the camera is free to turn
+ * past a half-circle. --mouse-look=<percent> scales the distance before it goes
+ * out, which is where how much of a turn one sweep of a hand is worth belongs:
+ * the library's own OPENNOW_MOUSE_SENSITIVITY (0.1..3.0) and
+ * OPENNOW_MOUSE_ACCELERATION (1.0..150.0) are read from the process environment
+ * by a once-evaluated lock, so a client execed bare by its launcher cannot set
+ * them, and this is the same scaling in a place where it can. The scale covers
+ * every distance this client sends, acts included: a sweep and an act aimed at
+ * a card grow together, which is why the act lists of the measurement rounds
+ * stay at the 100 default - a scale above 100 would walk an act past the card
+ * it was armed for. A distance the int16 cannot carry is sent as several whole
+ * MouseMove packets rather than clipped, because a clipped turn is a turn the
+ * seat's hand did not get to finish. */
+static unsigned mouse_look_percent = 100u;
+
+static void pointer_delta(struct lite *a, int dx, int dy)
+{
+    if (!streamer.engine || !streamer.capture_active)
+        return;
+    long want_x = (long)dx * (long)mouse_look_percent / 100;
+    long want_y = (long)dy * (long)mouse_look_percent / 100;
+    if (want_x == 0 && want_y == 0)
+        return;
+    while (want_x || want_y) {
+        int sent_x = want_x > 32767 ? 32767 : (want_x < -32767 ? -32767 : (int)want_x);
+        int sent_y = want_y > 32767 ? 32767 : (want_y < -32767 ? -32767 : (int)want_y);
+        if (pointer_state.placed) {
+            /* the reference follows what was sent rather than what was asked for,
+             * so a distance the int16 cannot carry is not lost a second time */
+            pointer_state.placed_x += sent_x;
+            pointer_state.placed_y += sent_y;
+        }
+        struct timespec at;
+        bool timed = debug_input && input_timed < 400u;
+        if (timed)
+            clock_gettime(CLOCK_MONOTONIC, &at);
+        OpenNowStreamerStatus status =
+            streamer.relative(streamer.engine, (int16_t)sent_x, (int16_t)sent_y);
+        if (timed)
+            note_submit("relative", &at);
+        if (status == OPENNOW_STREAMER_OK)
+            ++a->submits;
+        else if (a->input_refused++ == 0u)
+            fprintf(stderr, "opennowlite-input: motion submit refused (%d)\n",
+                    (int)status);
+        want_x -= sent_x;
+        want_y -= sent_y;
+    }
+}
+
+static void pointer_relative(struct lite *a, double x, double y)
+{
+    /* This is the fallback for a compositor without a relative pointer: the
+     * seat still only reports a place, so the distance is what changed since
+     * the place this client last put on the wire. The first motion sends one
+     * absolute position, which is where the game's cursor starts from: a
+     * distance measured against an unseen corner would turn the camera by the
+     * whole width of the window before the user ever swept a hand. Waiting for
+     * capture keeps that placement from being marked done before there is an
+     * engine to send it to. */
+    if (!streamer.engine || !streamer.capture_active)
+        return;
+    if (!pointer_state.placed) {
+        pointer_submit(a, x, y);
+        pointer_state.placed = true;
+        pointer_state.placed_x = (int)(x + 0.5);
+        pointer_state.placed_y = (int)(y + 0.5);
+        return;
+    }
+    pointer_delta(a, (int)(x + 0.5) - pointer_state.placed_x,
+                  (int)(y + 0.5) - pointer_state.placed_y);
+}
+
+/* what every pointer event goes through, so --mouse-relative switches the whole
+ * path at once rather than one call site at a time. */
+static void pointer_move(struct lite *a, double x, double y)
+{
+    if (a->mouse_relative) {
+        double extent_x = (double)a->width - 1.0;
+        double extent_y = (double)a->height - 1.0;
+        /* the seat's place is only meaningful inside the window, so clamp it the
+         * same way an absolute position is before turning it into a distance */
+        if (x < 0.0)
+            x = 0.0;
+        if (x > extent_x)
+            x = extent_x;
+        if (y < 0.0)
+            y = 0.0;
+        if (y > extent_y)
+            y = extent_y;
+        pointer_relative(a, x, y);
+        return;
+    }
+    pointer_submit(a, x, y);
 }
 
 static void pointer_scroll(struct lite *a)
@@ -2853,6 +3165,8 @@ static void seat_key(uint32_t code, bool pressed)
  * while the r1.2 round's 1734 positions held a full hour of it. */
 static long pilot_press_at[1200];
 static uint16_t pilot_press_key[1200];
+static int16_t pilot_move_dx[1200];
+static int16_t pilot_move_dy[1200];
 static unsigned long pilot_press_count;
 
 static void pilot_send(struct lite *a)
@@ -2868,7 +3182,9 @@ static void pilot_send(struct lite *a)
             return;
         /* then, if asked for, one left click at a stated point: in absolute
          * mode a click cannot land without a position, so the position goes
-         * first and the vendor keeps the order. */
+         * first and the vendor keeps the order; relative mode sends the
+         * distance to that point instead, which is only as close as the game's
+         * own mouse-look says it is. */
         unsigned long extra = a->pilot_steps - 2u * pilot_press_count;
         long due = pilot_press_at[pilot_press_count - 1u] + 3L
                  + (long)extra;
@@ -2881,7 +3197,7 @@ static void pilot_send(struct lite *a)
                 point_x = (double)a->width / 2.0;
             if (point_y <= 0.0)
                 point_y = (double)a->height / 2.0;
-            pointer_submit(a, point_x, point_y);
+            pointer_move(a, point_x, point_y);
         } else {
             bool pressed = extra == 1u;
             struct timespec click_at;
@@ -2919,12 +3235,43 @@ static void pilot_send(struct lite *a)
          * the host's idle timer and lands on nothing that a menu acts on, so the
          * keep clock moves the cursor a few pixels either side of the middle. */
         if (pressed) {
-            double x = (double)(a->width / 2 + (press % 2u ? 40 : -40));
-            double y = (double)(a->height / 2);
-            pointer_submit(a, x, y);
-            ++a->pilot_jiggles;
-            fprintf(stderr, "opennowlite-pilot: jiggle %lu x=%.0f y=%.0f at +%lds due=+%lds\n",
-                    a->pilot_jiggles, x, y, elapsed, due);
+            if (a->mouse_relative) {
+                /* a distance rather than a place: a few pixels of turn is still
+                 * activity the host counts, and unlike the 80 px swing below it
+                 * does not move the camera the user is looking through every gap
+                 * of the keep clock. */
+                int dx = (press % 2u) ? 4 : -4;
+                pointer_delta(a, dx, 0);
+                ++a->pilot_jiggles;
+                fprintf(stderr,
+                        "opennowlite-pilot: jiggle %lu dx=%d dy=0 at +%lds due=+%lds\n",
+                        a->pilot_jiggles, dx, elapsed, due);
+            } else {
+                double x = (double)(a->width / 2 + (press % 2u ? 40 : -40));
+                double y = (double)(a->height / 2);
+                pointer_submit(a, x, y);
+                ++a->pilot_jiggles;
+                fprintf(stderr, "opennowlite-pilot: jiggle %lu x=%.0f y=%.0f at +%lds due=+%lds\n",
+                        a->pilot_jiggles, x, y, elapsed, due);
+            }
+        }
+        ++a->pilot_steps;
+        return;
+    }
+    if (pilot_press_key[press] == 0x8000u) {
+        /* `:m<dx>x<dy>` arms one MouseMove rather than a key: a distance nobody
+         * has to sweep with a hand at the seat, so a list of them all facing one
+         * way is a turn the witness can be measured against the half-circle an
+         * absolute cursor stopped at, which is how an unattended round proves
+         * --mouse-relative. The release step sends nothing, since a distance
+         * has no button to let go of. */
+        if (pressed) {
+            pointer_delta(a, pilot_move_dx[press], pilot_move_dy[press]);
+            ++a->pilot_moves;
+            fprintf(stderr,
+                    "opennowlite-pilot: move %lu dx=%d dy=%d at +%lds due=+%lds\n",
+                    a->pilot_moves, (int)pilot_move_dx[press],
+                    (int)pilot_move_dy[press], elapsed, due);
         }
         ++a->pilot_steps;
         return;
@@ -2965,7 +3312,7 @@ static void pilot_send(struct lite *a)
         if (point_y <= 0.0)
             point_y = (double)a->height / 2.0;
         if (pressed)
-            pointer_submit(a, point_x, point_y);
+            pointer_move(a, point_x, point_y);
         struct timespec at;
         bool timed = debug_input && input_timed < 400u;
         if (timed)
@@ -3023,7 +3370,7 @@ static void seat_motion(struct lite *a, double x, double y)
             fprintf(stderr, "opennowlite-input: pointer outside the window ignored\n");
         return;
     }
-    pointer_submit(a, x, y);
+    pointer_move(a, x, y);
 }
 
 /* weston numbers buttons by their evdev code, not 1/2/3: a wl_pointer.button
@@ -3047,8 +3394,10 @@ static void seat_button(struct lite *a, uint32_t button, uint32_t state)
         return;
     /* Upstream sends the position and then the button, on a release as well as
      * a press, because no move event is guaranteed before a click and both
-     * have to keep their queue order. */
-    if (a->pointer_surface == a->surface)
+     * have to keep their queue order. Relative mode sends the button alone: a
+     * place there is a jump the user never made, and what the game needs for a
+     * hit test is already the cursor it has been moving by distances. */
+    if (!a->mouse_relative && a->pointer_surface == a->surface)
         pointer_submit(a, pointer_state.last_x, pointer_state.last_y);
     struct timespec at;
     bool timed = debug_input && input_timed < 400u;
@@ -3069,7 +3418,7 @@ static void seat_button(struct lite *a, uint32_t button, uint32_t state)
 static void seat_wheel(struct lite *a, int32_t value120)
 {
     pointer_state.wheel += value120;
-    if (a->pointer_surface == a->surface)
+    if (!a->mouse_relative && a->pointer_surface == a->surface)
         pointer_submit(a, pointer_state.last_x, pointer_state.last_y);
     pointer_scroll(a);
 }
@@ -3129,6 +3478,24 @@ static unsigned long pilot_list_parse(const char *list)
                 key = (uint16_t)(0x1000u
                                  | (uint16_t)strtol(colon + 2, NULL, 10));
                 break;
+            /* `:m<dx>x<dy>` arms one MouseMove rather than a key: the distance
+             * is what --mouse-relative answers a hand with, so a list of them
+             * all facing one way is a sweep an unattended round can prove a
+             * whole camera turn against, with no hand at the seat to sweep it.
+             * The list's own separator is a comma, so the two distances are
+             * split by an x the way --pilot-point spells a size, and `:m-40x0`
+             * turns back the other way. */
+            case 'm':
+            {
+                int dx = 0;
+                int dy = 0;
+                if (sscanf(colon + 2, "%dx%d", &dx, &dy) != 2)
+                    return 0u;
+                pilot_move_dx[count] = (int16_t)dx;
+                pilot_move_dy[count] = (int16_t)dy;
+                key = 0x8000u;
+                break;
+            }
             default:
                 return 0u;
             }
@@ -3149,7 +3516,7 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [--launch-app-id=ID] [--data-dir DIR] [--fullscreen]\n"
-            "       [--show-cursor] [--width N] [--height N] [--pipeline DESC] [--test-pattern]\n"
+            "       [--show-cursor] [--mouse-absolute] [--mouse-look=P] [--no-pointer-lock] [--width N] [--height N] [--pipeline DESC] [--test-pattern]\n"
             "       [--auto-pilot] [--pilot-at=S] [--pilot-times=N] [--pilot-gap=S]\n"
             "       [--pilot-click] [--pilot-point=WxH]\n"
             "       [--record=FILE] [--record-seconds=S] [--record-from=S] [--poll-attempts=N]\n"
@@ -3161,7 +3528,36 @@ static void usage(const char *argv0)
             "  session at all, which is how the window and the input path are\n"
             "  proven. --data-dir only points the shipped core at another copy\n"
             "  of its data directory; by default it uses this seat's. The seat's\n"
-            "  pointer is sent as an absolute position inside the window.\n"
+            "  pointer travels into the game as a distance (the streamer's\n"
+            "  MouseMove, NVST command 7, which is the game's own mouse-look\n"
+            "  input), because a place was measured to bound the camera at one\n"
+            "  half-turn: the seat's cursor is held at the window's own edge, so\n"
+            "  one sweep of a hand was one half-turn of the camera and the sweep\n"
+            "  back undid all of it. The distance now comes from the relative-\n"
+            "  pointer protocol, whose deltas weston does not clamp to the window,\n"
+            "  so a hand that keeps moving keeps turning the camera past 180 deg\n"
+            "  and past a full circle without being lifted; when the compositor\n"
+            "  has no relative pointer the client falls back to the change of the\n"
+            "  seat's place. The first motion of a round still sends one place, so\n"
+            "  the game's cursor starts where the seat's cursor already is rather\n"
+            "  than a whole window width away. --mouse-absolute puts the place back\n"
+            "  on the wire, which is what a screen that is hit-tested at a stated\n"
+            "  point wants. --mouse-look=<percent> (25..400, 100 by default) says\n"
+            "  how much of a turn one swept pixel is worth: the library's own\n"
+            "  OPENNOW_MOUSE_SENSITIVITY (0.1..3.0) and OPENNOW_MOUSE_ACCELERATION\n"
+            "  (1.0..150.0) are read from the process environment by a once-\n"
+            "  evaluated lock, so a client that was execed bare cannot set them and\n"
+            "  this is the same scaling where it can, with a distance too big for\n"
+            "  one int16 sent as whole MouseMove packets rather than clipped.\n"
+            "  While relative mode is on, the client also locks the seat's pointer\n"
+            "  to its surface (pointer-constraints, oneshot lifetime), so weston\n"
+            "  keeps the pointer over the window and the deltas keep arriving; the\n"
+            "  lock is released as soon as the pointer leaves, so it cannot trap\n"
+            "  the seat's pointer on this window. --no-pointer-lock keeps the\n"
+            "  distance path without the lock.\n"
+            "  A click keeps its button on the cursor the game has rather than\n"
+            "  republishing a place, and a stated --pilot-point click is walked to\n"
+            "  by a distance the same way.\n"
             "  By default the seat's desktop arrow is not drawn over the window:\n"
             "  the picture already carries the game's own pointer, and weston's\n"
             "  arrow on top of the picture was a second, laggier duplicate. A\n"
@@ -3188,14 +3584,23 @@ static void usage(const char *argv0)
             "  presses once per notice at --pilot-at, a comma list of seconds\n"
             "  after the stream starts, each optionally followed by the key the\n"
             "  notice names (`63:r,212:r` by default, r is Return, e Escape,\n"
-            "  s Space and c a left click at --pilot-point; an entry with no\n"
-            "  suffix is a pointer move). `:k` plus a number presses that\n"
+            "  s Space and c a left click at --pilot-point, m one MouseMove written\n"
+            "  as `<dx>x<dy>`; an entry with no suffix is a pointer move). `:k` plus a\n"
+            "  number presses that\n"
             "  physical key instead of a virtual one: the code goes through\n"
             "  seat_key, the function the seat's own keyboard enters at, so an\n"
             "  unattended round can show the code the seat was asked for and\n"
             "  the Windows virtual key the map answered with. The number is\n"
             "  the evdev scancode, so `:k16` is the seat's q, `:k57` its Space\n"
             "  and `:k103` its Up arrow.\n"
+            "  `:m` arms one MouseMove distance instead, which is what --mouse-\n"
+            "  relative answers a hand with: a list of them all facing one way is a\n"
+            "  turn the witness can be measured against without anyone at the seat\n"
+            "  sweeping a hand for it, which is how a round that has nobody in front\n"
+            "  of it can show the camera turning past the half-circle an absolute\n"
+            "  cursor stopped at. The keep clock then answers with 4 px of turn\n"
+            "  rather than the 80 px swing of places, so it keeps the host's idle\n"
+            "  timer down without swinging the camera the user is looking through.\n"
             "  A clock that presses twice per notice closes the host's own\n"
             "  windows, and keys after the notice list are measured to fail:\n"
             "  the Escape armed for the SIGN UP notice opened Destiny 2's own\n"
@@ -3227,6 +3632,8 @@ int main(int argc, char **argv)
     g_mutex_init(&media_lock);
     bool test_pattern = false;
     bool fullscreen = false;
+    bool mouse_relative = true;
+    bool pointer_lock = true;
     int width = 1920;
     int height = 1080;
     const char *variant_id = NULL;
@@ -3293,6 +3700,31 @@ int main(int argc, char **argv)
              * window asks for no cursor and the game's own pointer inside
              * the picture is the only one the seat then shows */
             show_cursor = true;
+        } else if (strcmp(argv[i], "--mouse-relative") == 0) {
+            /* the distance path is the default now, so naming it is naming what
+             * already happens; the pilot scripts still name it so an older
+             * script keeps meaning the same thing on a newer client */
+            mouse_relative = true;
+        } else if (strcmp(argv[i], "--mouse-absolute") == 0) {
+            /* put the place back on the wire: the game's cursor is placed where
+             * the seat's cursor is, which is what a screen that is hit-tested at
+             * a stated point wants, and what bounds the camera at the window's
+             * own edge - the half-turn the seat's hand kept hitting */
+            mouse_relative = false;
+        } else if (strcmp(argv[i], "--no-pointer-lock") == 0) {
+            /* keep the relative distance but let the seat's pointer leave the
+             * window; the deltas stop when it does, so this is a diagnostic
+             * switch rather than the way to play */
+            pointer_lock = false;
+        } else if (strncmp(argv[i], "--mouse-look=", 13) == 0) {
+            /* how much of a turn one swept pixel is worth */
+            mouse_look_percent = (unsigned)atoi(argv[i] + 13);
+            if (mouse_look_percent < 25u || mouse_look_percent > 400u) {
+                fprintf(stderr,
+                        "opennowlite: --mouse-look wants 25..400 percent\n");
+                usage(argv[0]);
+                return 2;
+            }
         } else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
             width = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
@@ -3388,6 +3820,8 @@ int main(int argc, char **argv)
     app.fullscreen = fullscreen;
     app.width = width;
     app.height = height;
+    app.mouse_relative = mouse_relative;
+    app.pointer_lock = pointer_lock;
     app.auto_pilot = auto_pilot;
     app.pilot_times = pilot_times;
     app.pilot_gap = pilot_gap;
@@ -3477,9 +3911,10 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "opennowlite: stopping keys=%lu motions=%lu submits=%lu refused=%lu skipped=%lu pilot=%lu jiggle=%lu\n",
+    fprintf(stderr, "opennowlite: stopping keys=%lu motions=%lu submits=%lu refused=%lu skipped=%lu pilot=%lu jiggle=%lu move=%lu\n",
             app.keys, app.motions, app.submits, app.input_refused,
-            app.pointer_skipped, app.pilot_presses, app.pilot_jiggles);
+            app.pointer_skipped, app.pilot_presses, app.pilot_jiggles,
+            app.pilot_moves);
     if (media.record) {
         const int record_failed = fclose(media.record) != 0;
         media.record = NULL;
